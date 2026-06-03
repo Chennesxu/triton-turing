@@ -1,0 +1,13 @@
+add_triton_library(TritonAMDGPUIR
+  Dialect.cpp
+  TargetFeatures.cpp
+
+  DEPENDS
+  TritonAMDGPUTableGen
+  TritonAMDGPUAttrDefsIncGen
+
+  LINK_LIBS PUBLIC
+  MLIRLLVMDialect
+  TritonIR
+  TritonGPUIR
+)

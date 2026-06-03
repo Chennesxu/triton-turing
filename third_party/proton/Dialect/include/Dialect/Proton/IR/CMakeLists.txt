@@ -1,0 +1,17 @@
+set(MLIR_BINARY_DIR ${CMAKE_BINARY_DIR})
+
+set(LLVM_TARGET_DEFINITIONS ProtonOps.td)
+mlir_tablegen(Ops.h.inc -gen-op-decls)
+mlir_tablegen(Ops.cpp.inc -gen-op-defs)
+mlir_tablegen(Dialect.h.inc -gen-dialect-decls -dialect=proton)
+mlir_tablegen(Dialect.cpp.inc -gen-dialect-defs -dialect=proton)
+add_mlir_doc(ProtonOps ProtonOps dialects/ -gen-op-doc -dialect=proton)
+add_mlir_doc(ProtonDialect ProtonDialect dialects/ -gen-dialect-doc -dialect=proton)
+add_public_tablegen_target(ProtonTableGen)
+
+set(LLVM_TARGET_DEFINITIONS ProtonAttrDefs.td)
+mlir_tablegen(AttrDefs.h.inc -gen-attrdef-decls)
+mlir_tablegen(AttrDefs.cpp.inc -gen-attrdef-defs)
+mlir_tablegen(OpsEnums.h.inc -gen-enum-decls)
+mlir_tablegen(OpsEnums.cpp.inc -gen-enum-defs)
+add_public_tablegen_target(ProtonAttrDefsIncGen)

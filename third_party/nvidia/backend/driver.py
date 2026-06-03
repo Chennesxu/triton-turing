@@ -1,0 +1,402 @@
+import functools
+import os
+import subprocess
+import triton
+import ctypes
+import sys
+from triton import knobs
+from triton.runtime.build import compile_module_from_file
+from triton.runtime import _allocation
+from triton.backends.compiler import GPUTarget
+from triton.backends.driver import GPUDriver, decompose_descriptor, expand_signature, wrap_handle_tensordesc_impl
+
+dirname = os.path.dirname(os.path.realpath(__file__))
+include_dirs = [os.path.join(dirname, "include")]
+libdevice_dir = os.path.join(dirname, "lib")
+libraries = ['libcuda.so.1']
+PyCUtensorMap = None
+PyKernelArg = None
+ARG_CONSTEXPR = None
+ARG_KERNEL = None
+ARG_TUPLE = None
+GSAN_PER_DEVICE_STATE_STRIDE = 1 << 30
+
+
+@functools.lru_cache()
+def libcuda_dirs():
+    if env_libcuda_path := knobs.nvidia.libcuda_path:
+        return [env_libcuda_path]
+
+    libs = subprocess.check_output(["/sbin/ldconfig", "-p"]).decode(errors="ignore")
+    # each line looks like the following:
+    # libcuda.so.1 (libc6,x86-64) => /lib/x86_64-linux-gnu/libcuda.so.1
+    locs = [line.split()[-1] for line in libs.splitlines() if "libcuda.so.1" in line]
+    dirs = [os.path.dirname(loc) for loc in locs]
+    env_ld_library_path = os.getenv("LD_LIBRARY_PATH")
+    if env_ld_library_path and not dirs:
+        dirs = [dir for dir in env_ld_library_path.split(":") if os.path.exists(os.path.join(dir, "libcuda.so.1"))]
+    msg = 'libcuda.so cannot found!\n'
+    if locs:
+        msg += 'Possible files are located at %s.' % str(locs)
+        msg += 'Please create a symlink of libcuda.so to any of the files.'
+    else:
+        msg += 'Please make sure GPU is set up and then run "/sbin/ldconfig"'
+        msg += ' (requires sudo) to refresh the linker cache.'
+    assert any(os.path.exists(os.path.join(path, 'libcuda.so.1')) for path in dirs), msg
+    return dirs
+
+
+@functools.lru_cache()
+def library_dirs():
+    return [libdevice_dir, *libcuda_dirs()]
+
+
+def _cuda_driver_is_active():
+    candidates = ["libcuda.so.1"]
+    try:
+        candidates.extend([os.path.join(path, "libcuda.so.1") for path in libcuda_dirs()])
+    except Exception:
+        pass
+
+    libcuda = None
+    for candidate in candidates:
+        try:
+            libcuda = ctypes.CDLL(candidate)
+            break
+        except OSError:
+            continue
+
+    if libcuda is None:
+        return False
+
+    cu_init = libcuda.cuInit
+    cu_init.argtypes = [ctypes.c_uint]
+    cu_init.restype = ctypes.c_int
+    if cu_init(0) != 0:
+        return False
+
+    cu_device_get_count = libcuda.cuDeviceGetCount
+    cu_device_get_count.argtypes = [ctypes.POINTER(ctypes.c_int)]
+    cu_device_get_count.restype = ctypes.c_int
+    count = ctypes.c_int()
+    if cu_device_get_count(ctypes.byref(count)) != 0:
+        return False
+
+    return count.value > 0
+
+
+# ------------------------
+# Utils
+# ------------------------
+
+
+class CudaUtils(object):
+
+    def __new__(cls):
+        if not hasattr(cls, "instance"):
+            cls.instance = super(CudaUtils, cls).__new__(cls)
+        return cls.instance
+
+    def __init__(self):
+        mod = compile_module_from_file(
+            src_path=os.path.join(dirname, "driver.c"),
+            name="cuda_utils",
+            library_dirs=library_dirs(),
+            include_dirs=include_dirs,
+            libraries=libraries,
+        )
+        global PyCUtensorMap
+        global PyKernelArg
+        global ARG_CONSTEXPR
+        global ARG_KERNEL
+        global ARG_TUPLE
+        PyCUtensorMap = mod.PyCUtensorMap
+        PyKernelArg = mod.PyKernelArg
+        ARG_CONSTEXPR = mod.ARG_CONSTEXPR
+        ARG_KERNEL = mod.ARG_KERNEL
+        ARG_TUPLE = mod.ARG_TUPLE
+        self.load_binary = mod.load_binary
+        self.unload_module = mod.unload_module
+        self.get_current_device = mod.get_current_device
+        self.set_current_device = mod.set_current_device
+        self.get_default_stream = mod.get_default_stream
+        self.get_device_capability = mod.get_device_capability
+        self.get_device_properties = mod.get_device_properties
+        self.cuOccupancyMaxActiveClusters = mod.cuOccupancyMaxActiveClusters
+        self.set_printf_fifo_size = mod.set_printf_fifo_size
+        self.fill_tma_descriptor_tiled = mod.fill_tma_descriptor_tiled
+        self.fill_tma_descriptor_im2col = mod.fill_tma_descriptor_im2col
+        self.launch = mod.launch
+        self.build_signature_metadata = mod.build_signature_metadata
+
+
+# ------------------------
+# Launcher
+# ------------------------
+
+
+def ty_to_cpp(ty):
+    if ty[0] == '*':
+        return "CUdeviceptr"
+    if ty.startswith("tensordesc"):
+        return "CUtensorMap"
+    return {
+        "i1": "int8_t",
+        "i8": "int8_t",
+        "i16": "int16_t",
+        "i32": "int32_t",
+        "i64": "int64_t",
+        "u1": "uint8_t",
+        "u8": "uint8_t",
+        "u16": "uint16_t",
+        "u32": "uint32_t",
+        "u64": "uint64_t",
+        "fp16": "double",
+        "bf16": "double",
+        "fp32": "double",
+        "f32": "double",
+        "fp64": "double",
+        "nvTmaDesc": "CUtensorMap",
+    }[ty]
+
+
+def make_kernel_signature(signature):
+    """
+    Creates a kernel signature in C to be able to efficiently extract
+    arguments in the launcher.
+    """
+
+    def _flatten_signature(sig, output):
+        # Flatten tuples
+        if isinstance(sig, tuple):
+            for x in sig:
+                _flatten_signature(x, output)
+        else:
+            output.append(sig)
+
+    flat_signature = []
+    for sig in signature:
+        _flatten_signature(sig, flat_signature)
+    kernel_signature = [x for x in flat_signature if x != "constexpr"]
+
+    return triton.runtime.driver.active.utils.build_signature_metadata(kernel_signature)
+
+
+def annotate_arguments(signature):
+    """
+    This recreates the signature with annotations as C objects which can then
+    be used to efficiently flatten tuples, and remove constexpr in the launcher.
+    """
+    annotated_arguments = []
+    for sig in signature:
+        if isinstance(sig, tuple):
+            annotated_arguments.append((PyKernelArg(nested_tuple=annotate_arguments(sig), type=ARG_TUPLE)))
+        elif sig != "constexpr":
+            annotated_arguments.append(PyKernelArg(nested_tuple=None, type=ARG_KERNEL))
+        else:
+            annotated_arguments.append(PyKernelArg(nested_tuple=None, type=ARG_CONSTEXPR))
+    return annotated_arguments
+
+
+# The TMA dtype enum values are slightly different on host vs device...
+TMA_DTYPE_DEVICE_TO_HOST = dict((i, i) for i in range(16))
+TMA_DTYPE_DEVICE_TO_HOST[8] = 10
+TMA_DTYPE_DEVICE_TO_HOST[9] = 8
+TMA_DTYPE_DEVICE_TO_HOST[10] = 9
+TMA_TF32 = 11
+
+
+def make_tensordesc_arg(arg, metadata, _):
+    if metadata is None:
+        return decompose_descriptor(arg)
+
+    swizzle = metadata["swizzle"]
+    elem_size = metadata["elem_size"]
+    elem_type = metadata["elem_type"]
+    block_size = metadata["block_size"]
+    fp4_padded = metadata["fp4_padded"]
+    is_im2col = metadata.get("is_im2col", False)
+
+    shape = arg.shape
+    strides = arg.strides
+    assert strides[-1] == 1
+    padding = 1 if arg.padding == "nan" else 0
+
+    if fp4_padded:
+        expanded_shape = list(shape)
+        expanded_shape[-1] *= 2
+    else:
+        expanded_shape = shape
+
+    if arg.round_f32_to_tf32:
+        elem_type = TMA_TF32
+
+    if is_im2col:
+        # Im2col mode - use im2col descriptor fill function
+        # block_size from metadata is [pixelsPerColumn, channelsPerPixel] (possibly clamped)
+        element_strides = arg.element_strides if arg.element_strides is not None else [1] * len(shape)
+        cu_tensor_map = triton.runtime.driver.active.utils.fill_tma_descriptor_im2col(
+            arg.base.data_ptr(),
+            swizzle,
+            elem_size,
+            TMA_DTYPE_DEVICE_TO_HOST[elem_type],
+            block_size,
+            expanded_shape,
+            strides,
+            padding,
+            arg.pixel_box_lower_corner,
+            arg.pixel_box_upper_corner,
+            element_strides,
+        )
+    else:
+        # Tiled mode - use existing tiled descriptor fill function
+        cu_tensor_map = triton.runtime.driver.active.utils.fill_tma_descriptor_tiled(
+            arg.base.data_ptr(),
+            swizzle,
+            elem_size,
+            TMA_DTYPE_DEVICE_TO_HOST[elem_type],
+            block_size,
+            expanded_shape,
+            strides,
+            padding,
+        )
+
+    return [cu_tensor_map, *shape, *strides]
+
+
+def wrap_handle_tensordesc(launcher, signature, tensordesc_meta):
+    return wrap_handle_tensordesc_impl(launcher, signature, tensordesc_meta, make_tensordesc_arg)
+
+
+class CudaLauncher(object):
+
+    def __init__(self, src, metadata):
+        constants = src.constants if hasattr(src, "constants") else dict()
+        arg_idx = lambda x: (src.fn.arg_names.index(x), ) if isinstance(x, str) else x
+        constants = {arg_idx(idx): value for idx, value in constants.items()}
+        signature = {idx: value for idx, value in src.signature.items()}
+        tensordesc_meta = getattr(metadata, "tensordesc_meta", None)
+
+        self.gsan_enabled = "gsan" in getattr(metadata, "instrumentation_mode", "")
+        if self.gsan_enabled:
+            signature["_gsan_globals_ptr"] = "*i8"
+
+        launcher = triton.runtime.driver.active.utils.launch
+        expanded_signature = expand_signature(signature.values(), tensordesc_meta, "nvTmaDesc")
+        self.arg_annotations = annotate_arguments(expanded_signature)
+        self.kernel_signature = make_kernel_signature(expanded_signature)
+        self.num_ctas = getattr(metadata, "num_ctas", 1)
+        self.launch = wrap_handle_tensordesc(launcher, signature, tensordesc_meta)
+        self.global_scratch_size = metadata.global_scratch_size
+        self.global_scratch_align = metadata.global_scratch_align
+        self.profile_scratch_size = metadata.profile_scratch_size
+        self.profile_scratch_align = metadata.profile_scratch_align
+        self.launch_cooperative_grid = metadata.launch_cooperative_grid
+        self.launch_pdl = metadata.launch_pdl
+
+    def __call__(self, gridX, gridY, gridZ, stream, function, kernel_metadata, launch_metadata, launch_enter_hook,
+                 launch_exit_hook, *args):
+        active_driver = triton.runtime.driver.active
+
+        def allocate_scratch(size, align, allocator):
+            if size > 0:
+                grid_size = gridX * gridY * gridZ
+                alloc_size = grid_size * self.num_ctas * size
+                alloc_fn = allocator.get()
+                return alloc_fn(alloc_size, align, stream)
+            return None
+
+        def allocate_default_profile_scratch(size, align):
+            if size > 0:
+                grid_size = gridX * gridY * gridZ
+                alloc_size = grid_size * self.num_ctas * size
+                return active_driver.allocate_default_profile_scratch(alloc_size, align, stream)
+            return None
+
+        global_scratch = allocate_scratch(self.global_scratch_size, self.global_scratch_align, _allocation._allocator)
+        if _allocation.has_profile_allocator():
+            profile_scratch = allocate_scratch(self.profile_scratch_size, self.profile_scratch_align,
+                                               _allocation._profile_allocator)
+        else:
+            profile_scratch = allocate_default_profile_scratch(self.profile_scratch_size, self.profile_scratch_align)
+
+        kernel_args = args
+        if self.gsan_enabled:
+            import triton.experimental.gsan._allocator as gsan_allocator
+            device = triton.runtime.driver.active.get_current_device()
+            gsan_state_ptr = gsan_allocator.get_global_state_pointer() + device * GSAN_PER_DEVICE_STATE_STRIDE
+            kernel_args = (*args, gsan_state_ptr)
+
+        self.launch(gridX, gridY, gridZ, stream, function, self.launch_cooperative_grid, self.launch_pdl,
+                    kernel_metadata, launch_metadata, launch_enter_hook, launch_exit_hook, global_scratch,
+                    profile_scratch, self.arg_annotations, self.kernel_signature, kernel_args)
+        if self.gsan_enabled:
+            import triton.experimental.gsan._stream_sync as gsan_stream_sync
+            gsan_stream_sync.synchronize_launch_stream(device)
+
+
+class CudaDriver(GPUDriver):
+
+    def __init__(self):
+        self.utils = CudaUtils()  # TODO: make static
+        self.launcher_cls = CudaLauncher
+        if sys.modules.get("torch") is not None:
+            super().__init__()
+        else:
+            self.get_device_capability = self._get_device_capability
+            self.get_current_stream = self._get_current_stream
+            self.get_current_device = self._get_current_device
+            self.set_current_device = self._set_current_device
+
+    def _get_device_capability(self, device):
+        return self.utils.get_device_capability(device)
+
+    def _get_current_stream(self, device):
+        # The CUDA driver API does not expose PyTorch's notion of the current
+        # stream. In torch-free launches we fall back to the device's default
+        # stream after making that device's primary context current.
+        return self.utils.get_default_stream(device)
+
+    def _get_current_device(self):
+        return self.utils.get_current_device()
+
+    def _set_current_device(self, device):
+        self.utils.set_current_device(device)
+
+    def get_current_target(self):
+        device = self.get_current_device()
+        capability = self.get_device_capability(device)
+        capability = capability[0] * 10 + capability[1]
+        warp_size = 32
+        return GPUTarget("cuda", capability, warp_size)
+
+    def get_active_torch_device(self):
+        import torch
+        return torch.device("cuda", self.get_current_device())
+
+    def get_device_interface(self):
+        import torch
+        return torch.cuda
+
+    @staticmethod
+    def is_active():
+        return _cuda_driver_is_active()
+
+    def map_python_to_cpp_type(self, ty: str) -> str:
+        return ty_to_cpp(ty)
+
+    def get_benchmarker(self):
+        from triton.testing import do_bench
+        return do_bench
+
+    def get_empty_cache_for_benchmark(self):
+        import torch
+
+        # We maintain a buffer of 256 MB that we clear
+        # before each kernel call to make sure that the L2 cache
+        # doesn't contain any input data before the run
+        cache_size = 256 * 1024 * 1024
+        return torch.empty(int(cache_size // 4), dtype=torch.int, device='cuda')
+
+    def clear_cache(self, cache):
+        cache.zero_()
