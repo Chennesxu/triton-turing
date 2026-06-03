@@ -24,6 +24,19 @@ For previous conference materials, see:
 
 This is the development repository of Triton, a language and compiler for writing highly efficient custom Deep-Learning primitives. The aim of Triton is to provide an open-source environment to write fast code at higher productivity than CUDA, but also with higher flexibility than other existing DSLs.
 
+## Turing (SM 7.5) Support — This Fork
+
+This fork restores and extends Triton's support for NVIDIA Turing GPUs (sm75, e.g. RTX 2080 Ti / Titan RTX), which was dropped in upstream Triton after v2.x.
+
+**Current status:**
+- MMA acceleration (`mma.sync.aligned.m16n8k8`) re-enabled for sm75
+- `optimize_dot_operands` pass enabled for sm75 (layout hoisting)
+- Verified on Titan RTX with fp16 matmul kernels
+
+**Planned:**
+- Software double-buffering without `cp.async` — using `ld.global + st.shared + bar.sync` to overlap load and MMA, replacing the Ampere `cp.async` pipeline path
+- Turing-specific autotune configs tuned for 96 KB shared memory and `m16n8k8` instruction shape
+
 The foundations of this project are described in the following MAPL2019 publication: [Triton: An Intermediate Language and Compiler for Tiled Neural Network Computations](http://www.eecs.harvard.edu/~htk/publication/2019-mapl-tillet-kung-cox.pdf). Please consider citing this work if you use Triton!
 
 The [official documentation](https://triton-lang.org) contains installation instructions and tutorials.  See also these third-party [Triton puzzles](https://github.com/srush/Triton-Puzzles), which can all be run using the Triton interpreter -- no GPU required.
