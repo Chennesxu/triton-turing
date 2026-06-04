@@ -9,6 +9,7 @@ Upstream Triton supports Turing's MMA instructions, but critical optimizations w
 1. **Enable layout optimization** — `optimize_dot_operands` pass for sm75 (layout hoisting before MMA)
 2. **Software double-buffering without `cp.async`** — implement a `ld.global → st.shared → bar.sync` pipeline path to overlap memory loads with MMA on Turing
 3. **Turing-specific autotune** — configs tuned for 96 KB shared memory and native instruction shapes (fp16: `m16n8k8`, int8: `m8n8k16`)
+4. **int4 MMA support** — implement `m8n8k32` instruction path for int4 precision (hardware-supported but not implemented in upstream Triton)
 
 ## Status
 
@@ -18,6 +19,7 @@ Upstream Triton supports Turing's MMA instructions, but critical optimizations w
 | Verified on Titan RTX (fp16 matmul) | ✅ Done |
 | Software double-buffering (`ld.global + bar.sync` pipeline) | 🚧 Planned |
 | Turing-specific autotune configs | 🚧 Planned |
+| int4 MMA (`m8n8k32`) support | 🚧 Planned |
 
 ## Installation
 
