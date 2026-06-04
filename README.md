@@ -1,25 +1,23 @@
-# Triton — Turing (SM 7.5) Fork
+# Triton-Turing
 
-This fork restores and extends [Triton](https://github.com/triton-lang/triton)'s support for NVIDIA Turing GPUs (sm75, e.g. RTX 2080 Ti / Titan RTX).
+**Triton-Turing** is a community-maintained fork of [Triton](https://github.com/triton-lang/triton) focused on restoring high-performance Tensor Core support for NVIDIA Turing GPUs (SM75: RTX 2080 Ti, Titan RTX).
 
-Upstream Triton dropped Turing support after v2.x: the MMA path was gated to sm80+, and the software pipeline exclusively uses `cp.async`, which is an Ampere-only instruction. As a result, Turing GPUs silently fall back to FMA, losing all tensor-core acceleration.
+Upstream Triton supports Turing's MMA instructions, but critical optimizations were gated to SM80+ (Ampere and later). Specifically, the `optimize_dot_operands` pass (which hoists layout conversions before matmul) was disabled for sm75, and the software pipeline exclusively uses `cp.async`, an Ampere-only instruction. As a result, Turing performance degrades significantly compared to its tensor-core potential.
 
 ## Goals
 
-1. **Restore MMA acceleration** — re-enable `mma.sync.aligned.m16n8k8` for sm75
-2. **Enable layout optimization** — `optimize_dot_operands` pass for sm75 (layout hoisting before MMA)
-3. **Software double-buffering without `cp.async`** — implement a `ld.global → st.shared → bar.sync` pipeline path to overlap memory loads with MMA on Turing, replacing the Ampere-only `cp.async` path
-4. **Turing-specific autotune** — autotune configs tuned for 96 KB shared memory and `m16n8k8` instruction shape
+1. **Enable layout optimization** — `optimize_dot_operands` pass for sm75 (layout hoisting before MMA)
+2. **Software double-buffering without `cp.async`** — implement a `ld.global → st.shared → bar.sync` pipeline path to overlap memory loads with MMA on Turing
+3. **Turing-specific autotune** — configs tuned for 96 KB shared memory and native instruction shapes (fp16: `m16n8k8`, int8: `m8n8k16`)
 
 ## Status
 
 | Feature | Status |
 |---|---|
-| `mma.sync.aligned.m16n8k8` re-enabled for sm75 | Done |
-| `optimize_dot_operands` for sm75 | Done |
-| Verified on Titan RTX (fp16 matmul) | Done |
-| Software double-buffering (`ld.global + bar.sync` pipeline) | Planned |
-| Turing-specific autotune configs | Planned |
+| `optimize_dot_operands` pass enabled for sm75 | ✅ Done |
+| Verified on Titan RTX (fp16 matmul) | ✅ Done |
+| Software double-buffering (`ld.global + bar.sync` pipeline) | 🚧 Planned |
+| Turing-specific autotune configs | 🚧 Planned |
 
 ## Installation
 
