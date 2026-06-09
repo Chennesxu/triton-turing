@@ -61,8 +61,16 @@ static int getMMAVersionSafe(int computeCapability, DotOp op) {
     assert(false && "computeCapability not supported");
   }
   for (int baseVersion : versionsSupported) {
-    if (supportMMA(op, baseVersion))
+    if (supportMMA(op, baseVersion)) {
+      // Turing (sm75) MMA only supports fp16; bf16 requires Ampere+.
+      if (computeCapability < 80) {
+        auto aElemTy = op.getA().getType().getElementType();
+        auto bElemTy = op.getB().getType().getElementType();
+        if (aElemTy.isBF16() || bElemTy.isBF16())
+          continue;
+      }
       return baseVersion;
+    }
     if (baseVersion == 3) {
       auto remark = op.emitRemark()
                     << "MMA version 3 acceleration not applied due to "
