@@ -151,6 +151,34 @@ static Value createAlloc(scf::ForOp &forOp, Operation *loadOp,
       loadOp->getLoc(), sharedEnc, distance);
 }
 
+void createSyncCopy(scf::ForOp forOp, tt::LoadOp loadOp, Value alloc,
+                    Value insertIdx, Value extractIdx,
+                    CoarseSchedule &schedule) {
+  OpBuilderForStage builder(loadOp.getLoc(), forOp, schedule);
+  Operation *firstUse = getFirstUseOfPipelinedOp({loadOp}, forOp, schedule);
+  assert(firstUse && "LoadOp has no users");
+  OpBuilder::InsertionGuard guard(builder);
+  Location loc = loadOp.getLoc();
+
+  // producer: reg -> shared, then barrier
+  builder.setInsertionPoint(loadOp);
+  builder.setStageCluster(schedule[loadOp]);
+  Value view = createSingleBufferView(builder, alloc, insertIdx);
+  ttg::LocalStoreOp::create(builder, loadOp.getResult(), view);
+  ttg::BarrierOp::create(builder, loc,
+                         ttg::AddrSpace::Local);
+
+  // consumer: local_load, then barrier to prevent producer overwrite
+  builder.setStageCluster(schedule[firstUse]);
+  auto viewLoad = createSingleBufferView(builder, alloc, extractIdx);
+  replaceUsesWithLocalLoad(builder, loadOp->getResult(0), viewLoad, nullptr);
+  ttg::BarrierOp::create(builder, loc,
+                         ttg::AddrSpace::Local);
+
+  schedule.erase(loadOp);
+  loadOp->erase();
+}
+
 void createAsyncCopy(scf::ForOp forOp, tt::LoadOp loadOp, Value alloc,
                      Value insertIdx, Value extractIdx, int contiguity,
                      CoarseSchedule &schedule) {
@@ -432,7 +460,8 @@ bool loadRequiresAdditionalBuffer(Operation *loadOp) {
 }
 
 scf::ForOp lowerLoads(scf::ForOp forOp, CoarseSchedule &schedule,
-                      triton::ModuleAxisInfoAnalysis &axisInfoAnalysis) {
+                      triton::ModuleAxisInfoAnalysis &axisInfoAnalysis,
+                      int computeCapability) {
   llvm::MapVector<Operation *, AsyncLoad> asyncLoads;
   llvm::MapVector<int, LoadGroupInfo> loadGroups;
   llvm::SmallVector<Operation *> scalarLoads;
@@ -469,6 +498,9 @@ scf::ForOp lowerLoads(scf::ForOp forOp, CoarseSchedule &schedule,
             cast<RankedTensorType>(op.getResultTypes()[0]), sharedEncoding);
 
         canUseAsyncCp &= copyVecBytes >= 4;
+        // sm75 (Turing) has no cp.async; use synchronous copy path instead
+        if (computeCapability == 75)
+          canUseAsyncCp = false;
         if (canUseAsyncCp) {
           auto loadOp = cast<tt::LoadOp>(op);
           auto ptr = loadOp.getPtr();
@@ -479,7 +511,9 @@ scf::ForOp lowerLoads(scf::ForOp forOp, CoarseSchedule &schedule,
           contiguity = vec;
         }
       }
-      if (canUseAsyncCp || isTMALoad(&op)) {
+      if (canUseAsyncCp || isTMALoad(&op) ||
+          (computeCapability == 75 && isa<tt::LoadOp>(op) &&
+           sharedEncoding)) {
         if (loadRequiresAdditionalBuffer(&op)) {
           // Allocate additional buffer required by the wgmma pipelining.
           stageDiff += 1;
@@ -589,9 +623,14 @@ scf::ForOp lowerLoads(scf::ForOp forOp, CoarseSchedule &schedule,
   for (auto [op, asyncLoad] : asyncLoads) {
     auto [insertIdx, extractIdx, phase, _] = loadGroups[asyncLoad.stageDiff];
     if (auto loadOp = dyn_cast<tt::LoadOp>(op)) {
-      createAsyncCopy(forOp, loadOp, asyncLoad.alloc, insertIdx, extractIdx,
-                      asyncLoad.contiguity, schedule);
-      hasAsyncLoads = true;
+      if (computeCapability == 75) {
+        createSyncCopy(forOp, loadOp, asyncLoad.alloc, insertIdx, extractIdx,
+                       schedule);
+      } else {
+        createAsyncCopy(forOp, loadOp, asyncLoad.alloc, insertIdx, extractIdx,
+                        asyncLoad.contiguity, schedule);
+        hasAsyncLoads = true;
+      }
     } else if (auto loadOp = dyn_cast<tt::DescriptorLoadOp>(op)) {
       createTMAAsyncLoad(forOp, loadOp, asyncLoad.alloc, insertIdx, extractIdx,
                          asyncLoad.barrier, asyncLoad.waitOp, schedule);
@@ -1043,13 +1082,14 @@ scf::ForOp lowerMMAs(scf::ForOp forOp, CoarseSchedule &schedule) {
 /////////////////////////////
 
 void lowerLoop(scf::ForOp forOp,
-               triton::ModuleAxisInfoAnalysis &axisInfoAnalysis) {
+               triton::ModuleAxisInfoAnalysis &axisInfoAnalysis,
+               int computeCapability) {
   CoarseSchedule schedule;
   if (failed(schedule.deSerialize(forOp))) {
     return;
   }
   scf::ForOp newForOp = lowerMMAs(forOp, schedule);
-  newForOp = lowerLoads(newForOp, schedule, axisInfoAnalysis);
+  newForOp = lowerLoads(newForOp, schedule, axisInfoAnalysis, computeCapability);
   newForOp = lowerTMADescriptors(newForOp, schedule);
   schedule.serialize(newForOp);
 }
@@ -1058,12 +1098,13 @@ void lowerLoop(scf::ForOp forOp,
 
 void lowerLoops(ModuleOp moduleOp) {
   triton::ModuleAxisInfoAnalysis axisInfoAnalysis(moduleOp);
+  int computeCapability = getNVIDIAComputeCapability(moduleOp);
   SmallVector<scf::ForOp> loops;
   moduleOp->walk([&](scf::ForOp forOp) { loops.push_back(forOp); });
   if (loops.empty())
     return;
   for (auto forOp : loops) {
-    lowerLoop(forOp, axisInfoAnalysis);
+    lowerLoop(forOp, axisInfoAnalysis, computeCapability);
   }
 }
 
