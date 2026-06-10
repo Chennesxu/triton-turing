@@ -305,6 +305,18 @@ class CUDABackend(BaseBackend):
             # hoist again and allow hoisting out of if statements
             passes.ttgpuir.add_hoist_tmem_alloc(pm, True)
             nvidia.passes.ttnvgpuir.add_remove_tmem_tokens(pm)
+        elif capability == 75:
+            # Turing: same pipelining flow as Ampere/Hopper but without
+            # warp specialization. LowerLoops routes to the synchronous
+            # copy path (no cp.async on sm75).
+            passes.ttgpuir.add_fuse_nested_loops(pm)
+            passes.common.add_canonicalizer(pm)
+            passes.ttir.add_triton_licm(pm)
+            passes.common.add_canonicalizer(pm)
+            passes.ttgpuir.add_combine_tensor_select_and_if(pm)
+            passes.ttgpuir.add_assign_latencies(pm, opt.num_stages)
+            passes.ttgpuir.add_schedule_loops(pm)
+            passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
         else:
             passes.ttir.add_triton_licm(pm)
         passes.common.add_canonicalizer(pm)
