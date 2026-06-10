@@ -168,7 +168,15 @@ void createSyncCopy(scf::ForOp forOp, tt::LoadOp loadOp, Value alloc,
   builder.setInsertionPoint(firstUse);
   builder.setStageCluster(schedule[firstUse]);
   auto viewLoad = createSingleBufferView(builder, alloc, extractIdx);
-  replaceUsesWithLocalLoad(builder, loadOp->getResult(0), viewLoad, nullptr);
+  auto localLoad =
+      replaceUsesWithLocalLoad(builder, loadOp->getResult(0), viewLoad, nullptr);
+  // replaceUsesWithLocalLoad erases local_alloc users it folds into the
+  // pipeline buffer, which may include firstUse; anchor the barrier on ops we
+  // created ourselves instead of the (possibly dangling) insertion point.
+  if (localLoad)
+    builder.setInsertionPointAfter(localLoad);
+  else
+    builder.setInsertionPointAfter(viewLoad.getDefiningOp());
   ttg::BarrierOp::create(builder, loc, ttg::AddrSpace::Local);
 
   // producer: reg -> shared, then barrier. Unlike the async path, loadOp
@@ -1100,7 +1108,13 @@ void lowerLoop(scf::ForOp forOp,
 
 void lowerLoops(ModuleOp moduleOp) {
   triton::ModuleAxisInfoAnalysis axisInfoAnalysis(moduleOp);
-  int computeCapability = getNVIDIAComputeCapability(moduleOp);
+  // The module may target another vendor or, in lit tests, carry no target
+  // attribute at all; getNVIDIAComputeCapability asserts on both. Treat them
+  // as "not sm75" so only Turing modules take the sync copy path.
+  int computeCapability = 0;
+  auto targetAttr = moduleOp->getAttrOfType<StringAttr>(AttrTargetName);
+  if (targetAttr && targetAttr.getValue().starts_with("cuda:"))
+    computeCapability = getNVIDIAComputeCapability(moduleOp);
   SmallVector<scf::ForOp> loops;
   moduleOp->walk([&](scf::ForOp forOp) { loops.push_back(forOp); });
   if (loops.empty())
