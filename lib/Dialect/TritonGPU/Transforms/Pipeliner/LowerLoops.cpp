@@ -160,23 +160,25 @@ void createSyncCopy(scf::ForOp forOp, tt::LoadOp loadOp, Value alloc,
   OpBuilder::InsertionGuard guard(builder);
   Location loc = loadOp.getLoc();
 
-  // producer: reg -> shared, then barrier
-  builder.setInsertionPoint(loadOp);
-  builder.setStageCluster(schedule[loadOp]);
-  Value view = createSingleBufferView(builder, alloc, insertIdx);
-  ttg::LocalStoreOp::create(builder, loadOp.getResult(), view);
-  ttg::BarrierOp::create(builder, loc,
-                         ttg::AddrSpace::Local);
-
-  // consumer: local_load, then barrier to prevent producer overwrite
+  // consumer: local_load, then barrier to prevent producer overwrite.
+  // The original uses must be replaced before creating the local_store:
+  // replaceUsesWithLocalLoad rewrites all existing uses of loadOp, so a
+  // local_store created earlier would have its operand rewritten to the
+  // local_load result, losing the global load data.
+  builder.setInsertionPoint(firstUse);
   builder.setStageCluster(schedule[firstUse]);
   auto viewLoad = createSingleBufferView(builder, alloc, extractIdx);
   replaceUsesWithLocalLoad(builder, loadOp->getResult(0), viewLoad, nullptr);
-  ttg::BarrierOp::create(builder, loc,
-                         ttg::AddrSpace::Local);
+  ttg::BarrierOp::create(builder, loc, ttg::AddrSpace::Local);
 
-  schedule.erase(loadOp);
-  loadOp->erase();
+  // producer: reg -> shared, then barrier. Unlike the async path, loadOp
+  // stays alive: the local_store consumes its result and PipelineExpander
+  // still needs its stage in the schedule.
+  builder.setInsertionPointAfter(loadOp);
+  builder.setStageCluster(schedule[loadOp]);
+  Value view = createSingleBufferView(builder, alloc, insertIdx);
+  ttg::LocalStoreOp::create(builder, loadOp.getResult(), view);
+  ttg::BarrierOp::create(builder, loc, ttg::AddrSpace::Local);
 }
 
 void createAsyncCopy(scf::ForOp forOp, tt::LoadOp loadOp, Value alloc,
