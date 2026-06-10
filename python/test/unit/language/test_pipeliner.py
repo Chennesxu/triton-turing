@@ -426,6 +426,8 @@ def indirect_matmul_kernel(
 def test_indirect_matmul(BLOCK_M, BLOCK_N, BLOCK_K, num_stages, device):
     if (num_stages > 3 or (num_stages >= 3 and (BLOCK_M, BLOCK_N, BLOCK_K) == (128, 128, 128))) and is_hip():
         pytest.skip("Not enough shared memory on HIP.")
+    if num_stages >= 3 and is_cuda() and torch.cuda.get_device_capability() == (7, 5):
+        pytest.skip("Multibuffering at these block sizes exceeds Turing's 64KB shared memory per CTA.")
     M = BLOCK_M
     N = BLOCK_N
 

@@ -175,7 +175,9 @@ Operation *mlir::triton::predicateOp(RewriterBase &rewriter, Operation *op,
     return op;
   if (isConstantIntValue(pred, 1))
     return op;
-  if (isa<LLVM::AssumeOp, ttng::FenceAsyncSharedOp>(op))
+  // BarrierOp must execute uniformly across the CTA, so it cannot be
+  // predicated; running it for masked-off stages is safe.
+  if (isa<LLVM::AssumeOp, ttng::FenceAsyncSharedOp, ttg::BarrierOp>(op))
     return op;
   if (isa<ttg::AsyncCommitGroupOp, ttg::AsyncWaitOp>(op))
     return op;
