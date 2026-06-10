@@ -863,3 +863,26 @@ tt.func public @backwards_prop_existing(%arg0: i32, %arg1: tensor<128x4x!tt.ptr<
 }
 
 }
+
+// -----
+
+#blocked_skip = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
+
+module attributes {"ttg.num-warps" = 4 : i32} {
+
+// Loops that already contain a CTA barrier are not safe to reorder across
+// stages; isSafeToPipeline must skip them without assigning any schedule.
+// CHECK-LABEL: @skip_loop_with_handwritten_barrier
+// CHECK-NOT: loop.stage
+// CHECK-NOT: tt.scheduled_max_stage
+tt.func @skip_loop_with_handwritten_barrier(%lb : index, %ub : index, %step : index,
+                 %a_ptr_init : tensor<128x32x!tt.ptr<f16>, #blocked_skip>) -> () {
+  scf.for %iv = %lb to %ub step %step : index {
+    %a = tt.load %a_ptr_init {tt.latency = 2 : i32} : tensor<128x32x!tt.ptr<f16>, #blocked_skip>
+    ttg.barrier local
+    "use"(%a) : (tensor<128x32xf16, #blocked_skip>) -> ()
+  }
+  tt.return
+}
+
+}

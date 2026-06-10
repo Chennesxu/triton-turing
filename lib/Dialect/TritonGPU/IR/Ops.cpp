@@ -1530,6 +1530,10 @@ void BarrierOp::print(OpAsmPrinter &p) {
   } else {
     p << ' ' << stringifyAddrSpace(getAddrSpace());
   }
+  // Discardable attrs (e.g. the pipeliner's loop.stage/loop.cluster) must be
+  // printed or they are lost on a textual round-trip. addrSpace is already
+  // printed as the keyword above.
+  p.printOptionalAttrDict((*this)->getAttrs(), /*elidedAttrs=*/{"addrSpace"});
 }
 
 ParseResult BarrierOp::parse(OpAsmParser &parser, OperationState &result) {
@@ -1562,6 +1566,9 @@ ParseResult BarrierOp::parse(OpAsmParser &parser, OperationState &result) {
 
   result.addAttribute("addrSpace",
                       AddrSpaceAttr::get(parser.getContext(), addrSpaceRet));
+
+  if (parser.parseOptionalAttrDict(result.attributes))
+    return failure();
 
   return success();
 }

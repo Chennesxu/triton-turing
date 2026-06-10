@@ -626,16 +626,19 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 
 // -----
 
+// Turing fork: fp16 dots on sm75 use MMA v2 instead of the upstream FMA fallback.
+// CHECK: #[[$MMA:.+]] = #ttg.nvidia_mma<{versionMajor = 2, versionMinor = 1, warpsPerCTA = [2, 4], instrShape = [16, 8]}>
 #blocked = #ttg.blocked<{sizePerThread = [4, 4], threadsPerWarp = [1, 32], warpsPerCTA = [4, 2], order = [1, 0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "cuda:75", "ttg.threads-per-warp" = 32 : i32} {
-  // CHECK-LABEL: dot_fall_back_fma_before_ampere
-  tt.func public @dot_fall_back_fma_before_ampere(%arg0: tensor<128x64xf16, #ttg.dot_op<{opIdx = 0, parent = #blocked}>>, %arg1: tensor<64x256xf16, #ttg.dot_op<{opIdx = 1, parent = #blocked}>>, %arg2: tensor<128x256x!tt.ptr<f32>, #blocked>) {
+  // CHECK-LABEL: dot_mma_on_turing
+  tt.func public @dot_mma_on_turing(%arg0: tensor<128x64xf16, #ttg.dot_op<{opIdx = 0, parent = #blocked}>>, %arg1: tensor<64x256xf16, #ttg.dot_op<{opIdx = 1, parent = #blocked}>>, %arg2: tensor<128x256x!tt.ptr<f32>, #blocked>) {
     %cst = arith.constant dense<0.000000e+00> : tensor<128x256xf32, #blocked>
-    // CHECK:   %[[EXT0:.*]] = arith.extf %arg0
-    // CHECK:   %[[EXT1:.*]] = arith.extf %arg1
-    // CHECK:   %[[DOT:.*]] = tt.dot %[[EXT0]], %[[EXT1]]
+    // CHECK:   %[[A:.*]] = ttg.convert_layout %arg0 : {{.*}} -> tensor<128x64xf16, #ttg.dot_op<{opIdx = 0, parent = #[[$MMA]], kWidth = 2}>>
+    // CHECK:   %[[B:.*]] = ttg.convert_layout %arg1 : {{.*}} -> tensor<64x256xf16, #ttg.dot_op<{opIdx = 1, parent = #[[$MMA]], kWidth = 2}>>
+    // CHECK:   %[[DOT:.*]] = tt.dot %[[A]], %[[B]], %{{.*}} -> tensor<128x256xf32, #[[$MMA]]>
     %0 = tt.dot %arg0, %arg1, %cst, inputPrecision = tf32 : tensor<128x64xf16, #ttg.dot_op<{opIdx = 0, parent = #blocked}>> * tensor<64x256xf16, #ttg.dot_op<{opIdx = 1, parent = #blocked}>> -> tensor<128x256xf32, #blocked>
-    // CHECK:   tt.store %arg2, %[[DOT]]
+    // CHECK:   %[[RES:.*]] = ttg.convert_layout %[[DOT]] : tensor<128x256xf32, #[[$MMA]]> -> tensor<128x256xf32, #blocked>
+    // CHECK:   tt.store %arg2, %[[RES]]
     tt.store %arg2, %0 : tensor<128x256x!tt.ptr<f32>, #blocked>
     tt.return
   }
