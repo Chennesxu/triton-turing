@@ -44,6 +44,9 @@ module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32, ttg.targ
 // consumer reads the buffer view directly, no local_load is created, and the
 // original local_alloc disappears. This path used to crash with a dangling
 // insertion point because the alloc (the load's first use) is erased.
+// The consumer barrier must come after the read of the buffer (WAR: the slot
+// may not be overwritten while other warps still read it), which here is the
+// "use" op consuming the view directly.
 // CHECK-LABEL: @sync_copy_local_alloc_user
 // CHECK: %[[ALLOC:.*]] = ttg.local_alloc : () -> !ttg.memdesc<2x128x32
 // CHECK: scf.for
@@ -53,8 +56,8 @@ module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32, ttg.targ
 // CHECK:   %[[EXT:.*]] = ttg.memdesc_index %[[ALLOC]]{{\[}}%{{.*}}{{\]}} {loop.cluster = 0 : i32, loop.stage = 2 : i32}
 // CHECK-NOT: ttg.local_load
 // CHECK-NOT: ttg.local_alloc
-// CHECK:   ttg.barrier local {loop.cluster = 0 : i32, loop.stage = 2 : i32}
 // CHECK:   "use"(%[[EXT]])
+// CHECK-NEXT: ttg.barrier local {loop.cluster = 0 : i32, loop.stage = 2 : i32}
 tt.func @sync_copy_local_alloc_user(%lb : index, %ub : index, %step : index,
                  %a_ptr_init : tensor<128x32x!tt.ptr<f16>, #A> {tt.divisibility = dense<[16, 16]> : tensor<2xi32>, tt.contiguity = dense<[1, 16]> : tensor<2xi32>}) -> () {
   scf.for %iv = %lb to %ub step %step : index {
@@ -94,6 +97,40 @@ tt.func @sync_copy_three_stages(%lb : index, %ub : index, %step : index,
     %a = tt.load %a_ptr_init {loop.cluster = 2 : i32, loop.stage = 0 : i32} : tensor<128x32x!tt.ptr<f16>, #A>
     "use"(%a) {loop.cluster = 0 : i32, loop.stage = 3 : i32} : (tensor<128x32xf16, #A>) -> ()
   } {tt.scheduled_max_stage = 3 : i32}
+  tt.return
+}
+}
+
+// -----
+
+#A = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
+
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32, ttg.target = "cuda:75"} {
+// bar.sync is a CTA-wide fence over all of shared memory, so loads sharing a
+// stage/cluster share one producer barrier (after the last local_store) and
+// one consumer barrier (after the last read) instead of one pair per load:
+// 2 barriers per iteration for a GEMM-shaped loop, not 4.
+// CHECK-LABEL: @sync_copy_two_loads_share_barriers
+// CHECK: scf.for
+// CHECK:   ttg.local_store
+// CHECK-NOT: ttg.barrier
+// CHECK:   ttg.local_store
+// CHECK-NEXT: ttg.barrier local {loop.cluster = 2 : i32, loop.stage = 0 : i32}
+// CHECK-NOT: ttg.barrier
+// CHECK:   ttg.local_load
+// CHECK-NOT: ttg.barrier
+// CHECK:   ttg.local_load
+// CHECK-NEXT: ttg.barrier local {loop.cluster = 0 : i32, loop.stage = 2 : i32}
+// CHECK-NOT: ttg.barrier
+// CHECK:   "use"
+tt.func @sync_copy_two_loads_share_barriers(%lb : index, %ub : index, %step : index,
+                 %a_ptr_init : tensor<128x32x!tt.ptr<f16>, #A> {tt.divisibility = dense<[16, 16]> : tensor<2xi32>, tt.contiguity = dense<[1, 16]> : tensor<2xi32>},
+                 %b_ptr_init : tensor<128x32x!tt.ptr<f16>, #A> {tt.divisibility = dense<[16, 16]> : tensor<2xi32>, tt.contiguity = dense<[1, 16]> : tensor<2xi32>}) -> () {
+  scf.for %iv = %lb to %ub step %step : index {
+    %a = tt.load %a_ptr_init {loop.cluster = 2 : i32, loop.stage = 0 : i32} : tensor<128x32x!tt.ptr<f16>, #A>
+    %b = tt.load %b_ptr_init {loop.cluster = 2 : i32, loop.stage = 0 : i32} : tensor<128x32x!tt.ptr<f16>, #A>
+    "use"(%a, %b) {loop.cluster = 0 : i32, loop.stage = 2 : i32} : (tensor<128x32xf16, #A>, tensor<128x32xf16, #A>) -> ()
+  } {tt.scheduled_max_stage = 2 : i32}
   tt.return
 }
 }
