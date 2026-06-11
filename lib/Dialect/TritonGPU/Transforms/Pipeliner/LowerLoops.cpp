@@ -158,35 +158,106 @@ void createSyncCopy(scf::ForOp forOp, tt::LoadOp loadOp, Value alloc,
   Operation *firstUse = getFirstUseOfPipelinedOp({loadOp}, forOp, schedule);
   assert(firstUse && "LoadOp has no users");
   OpBuilder::InsertionGuard guard(builder);
-  Location loc = loadOp.getLoc();
 
-  // consumer: local_load, then barrier to prevent producer overwrite.
-  // The original uses must be replaced before creating the local_store:
-  // replaceUsesWithLocalLoad rewrites all existing uses of loadOp, so a
-  // local_store created earlier would have its operand rewritten to the
-  // local_load result, losing the global load data.
+  // consumer: read the extract slot. The original uses must be replaced
+  // before creating the local_store: replaceUsesWithLocalLoad rewrites all
+  // existing uses of loadOp, so a local_store created earlier would have its
+  // operand rewritten to the local_load result, losing the global load data.
   builder.setInsertionPoint(firstUse);
   builder.setStageCluster(schedule[firstUse]);
   auto viewLoad = createSingleBufferView(builder, alloc, extractIdx);
-  auto localLoad =
-      replaceUsesWithLocalLoad(builder, loadOp->getResult(0), viewLoad, nullptr);
-  // replaceUsesWithLocalLoad erases local_alloc users it folds into the
-  // pipeline buffer, which may include firstUse; anchor the barrier on ops we
-  // created ourselves instead of the (possibly dangling) insertion point.
-  if (localLoad)
-    builder.setInsertionPointAfter(localLoad);
-  else
-    builder.setInsertionPointAfter(viewLoad.getDefiningOp());
-  ttg::BarrierOp::create(builder, loc, ttg::AddrSpace::Local);
+  replaceUsesWithLocalLoad(builder, loadOp->getResult(0), viewLoad, nullptr);
 
-  // producer: reg -> shared, then barrier. Unlike the async path, loadOp
-  // stays alive: the local_store consumes its result and PipelineExpander
-  // still needs its stage in the schedule.
+  // producer: reg -> shared. Unlike the async path, loadOp stays alive: the
+  // local_store consumes its result and PipelineExpander still needs its
+  // stage in the schedule. The CTA barriers synchronizing producer and
+  // consumer are emitted once per stage/cluster group in placeSyncBarriers
+  // after all loads are lowered.
   builder.setInsertionPointAfter(loadOp);
   builder.setStageCluster(schedule[loadOp]);
   Value view = createSingleBufferView(builder, alloc, insertIdx);
   ttg::LocalStoreOp::create(builder, loadOp.getResult(), view);
-  ttg::BarrierOp::create(builder, loc, ttg::AddrSpace::Local);
+}
+
+// Synchronization invariants for the sm75 synchronous copy pipeline (Turing
+// has no cp.async; data moves ld.global -> registers -> local_store):
+//
+//   INV-RAW: between a local_store filling a buffer slot and any read of
+//   that slot there must be at least one CTA barrier, so consumers never
+//   observe a partially written tile.
+//
+//   INV-WAR: between a read of a buffer slot and the local_store that next
+//   overwrites it there must be at least one CTA barrier, so producers never
+//   clobber a tile other warps are still reading. With double buffering the
+//   overwrite of the slot read by iteration i happens in iteration i itself,
+//   so the barrier after the reads is load-bearing even within one iteration.
+//
+// bar.sync is a CTA-wide fence over all of shared memory, not a per-buffer
+// lock: one barrier after the last write of a producer group orders all of
+// the group's writes against all later reads, and one barrier after the last
+// read of a consumer group orders all reads against all later writes. One
+// barrier per (stage, cluster) group is therefore sufficient, instead of two
+// per load: for a GEMM with A and B loads this means 2 barriers per
+// iteration instead of 4. The PipelineExpander stamps the same loop body
+// into the prologue, so the producer barrier also fences the prefill stores
+// against the first kernel iteration's reads.
+void placeSyncBarriers(scf::ForOp forOp, CoarseSchedule &schedule,
+                       const DenseSet<Value> &syncAllocs) {
+  auto traceToBase = [](Value v) {
+    while (Operation *def = v.getDefiningOp()) {
+      if (!def->hasTrait<OpTrait::MemDescViewTrait>())
+        break;
+      v = def->getOperand(0);
+    }
+    return v;
+  };
+
+  struct GroupInfo {
+    Operation *lastWrite = nullptr;
+    Operation *lastRead = nullptr;
+    std::pair<int, CoarseSchedule::Cluster> stageCluster;
+  };
+  llvm::MapVector<std::pair<int, int>, GroupInfo> groups;
+
+  for (Operation &op : forOp.getBody()->without_terminator()) {
+    bool writes = false, reads = false;
+    if (auto store = dyn_cast<ttg::LocalStoreOp>(&op)) {
+      writes = syncAllocs.contains(traceToBase(store.getDst()));
+    } else if (!op.hasTrait<OpTrait::MemDescViewTrait>()) {
+      // Pure views are transparent; any other op consuming a pipeline buffer
+      // (local_load, a dot reading operands from shared memory, ...) is a
+      // read that the WAR barrier must cover.
+      for (Value operand : op.getOperands()) {
+        if (isa<ttg::MemDescType>(operand.getType()) &&
+            syncAllocs.contains(traceToBase(operand)))
+          reads = true;
+      }
+    }
+    if (!writes && !reads)
+      continue;
+    auto it = schedule.find(&op);
+    if (it == schedule.end())
+      continue;
+    auto [stage, cluster] = it->second;
+    GroupInfo &group = groups[{stage, *cluster}];
+    group.stageCluster = it->second;
+    if (writes)
+      group.lastWrite = &op;
+    if (reads)
+      group.lastRead = &op;
+  }
+
+  OpBuilderForStage builder(forOp.getLoc(), forOp, schedule);
+  for (auto &[key, group] : groups) {
+    builder.setStageCluster(group.stageCluster);
+    for (Operation *anchor : {group.lastWrite, group.lastRead}) {
+      if (!anchor)
+        continue;
+      builder.setInsertionPointAfter(anchor);
+      ttg::BarrierOp::create(builder, anchor->getLoc(),
+                             ttg::AddrSpace::Local);
+    }
+  }
 }
 
 void createAsyncCopy(scf::ForOp forOp, tt::LoadOp loadOp, Value alloc,
@@ -630,12 +701,14 @@ scf::ForOp lowerLoads(scf::ForOp forOp, CoarseSchedule &schedule,
   createTMABarrierAndWait(forOp, asyncLoads, loadGroups, schedule);
 
   bool hasAsyncLoads = false;
+  DenseSet<Value> syncAllocs;
   for (auto [op, asyncLoad] : asyncLoads) {
     auto [insertIdx, extractIdx, phase, _] = loadGroups[asyncLoad.stageDiff];
     if (auto loadOp = dyn_cast<tt::LoadOp>(op)) {
       if (computeCapability == 75) {
         createSyncCopy(forOp, loadOp, asyncLoad.alloc, insertIdx, extractIdx,
                        schedule);
+        syncAllocs.insert(asyncLoad.alloc);
       } else {
         createAsyncCopy(forOp, loadOp, asyncLoad.alloc, insertIdx, extractIdx,
                         asyncLoad.contiguity, schedule);
@@ -659,6 +732,9 @@ scf::ForOp lowerLoads(scf::ForOp forOp, CoarseSchedule &schedule,
     if (loadGroup.phase)
       forYield.setOperand(argIdx++, loadGroup.phase);
   }
+
+  if (!syncAllocs.empty())
+    placeSyncBarriers(forOp, schedule, syncAllocs);
 
   // Automatically discover dependencies and schedule new insert/extract ops to
   // correct stages.
