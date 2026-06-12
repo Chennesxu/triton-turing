@@ -1324,3 +1324,64 @@ tt.func @sm75_static_alloc_shrinks_budget(%lb : index, %ub : index, %step : inde
   tt.return %loop#2: tensor<128x128xf32, #C>
 }
 }
+
+// -----
+
+#AL = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#BL = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+#C = #ttg.nvidia_mma<{versionMajor = 2, warpsPerCTA = [4, 1], instrShape = [16, 8]}>
+#A = #ttg.dot_op<{opIdx = 0, parent = #C, kWidth=2}>
+#B = #ttg.dot_op<{opIdx = 1, parent = #C, kWidth=2}>
+#AI = #ttg.dot_op<{opIdx = 0, parent = #C, kWidth=4}>
+#BI = #ttg.dot_op<{opIdx = 1, parent = #C, kWidth=4}>
+
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32, ttg.target = "cuda:75"} {
+// The >= 4-byte floor in canBeConvertedToAsyncLoad is cp.async's minimum
+// transfer size. The sm75 sync copy path has no such constraint, so a
+// contiguity-1 fp16 load (16 bits) - rejected upstream, see @small_load -
+// is pipelined on Turing.
+// CHECK-LABEL: @sm75_small_load_pipelined
+tt.func @sm75_small_load_pipelined(%lb : index, %ub : index, %step : index,
+                  %a_ptr_init : tensor<128x32x!tt.ptr<f16>, #AL> {tt.divisibility = dense<[16, 16]> : tensor<2xi32>, tt.contiguity = dense<[1, 32]> : tensor<2xi32>},
+                  %b_ptr_init : tensor<32x128x!tt.ptr<f16>, #BL>) -> tensor<128x128xf32, #C> {
+  %c_init = arith.constant dense<0.00e+00> : tensor<128x128xf32, #C>
+  %a_off = arith.constant dense<4> : tensor<128x32xi32, #AL>
+  %b_off = arith.constant dense<4> : tensor<32x128xi32, #BL>
+  %loop:3 = scf.for %iv = %lb to %ub step %step iter_args(%a_ptr = %a_ptr_init, %b_ptr = %b_ptr_init, %prev_c = %c_init) -> (tensor<128x32x!tt.ptr<f16>, #AL>, tensor<32x128x!tt.ptr<f16>, #BL>, tensor<128x128xf32, #C>) {
+    // CHECK: tt.load {{.*}} {tt.latency = 2 : i32}
+    %a_ = tt.load %a_ptr : tensor<128x32x!tt.ptr<f16>, #AL>
+    %a = ttg.convert_layout %a_ : tensor<128x32xf16, #AL> -> tensor<128x32xf16, #A>
+    // CHECK: tt.load {{.*}} {tt.latency = 2 : i32}
+    %b_ = tt.load %b_ptr : tensor<32x128x!tt.ptr<f16>, #BL>
+    %b = ttg.convert_layout %b_ : tensor<32x128xf16, #BL> -> tensor<32x128xf16, #B>
+    %c = tt.dot %a, %b, %prev_c : tensor<128x32xf16, #A> * tensor<32x128xf16, #B> -> tensor<128x128xf32, #C>
+    %next_a_ptr = tt.addptr %a_ptr, %a_off : tensor<128x32x!tt.ptr<f16>, #AL>, tensor<128x32xi32, #AL>
+    %next_b_ptr = tt.addptr %b_ptr, %b_off : tensor<32x128x!tt.ptr<f16>, #BL>, tensor<32x128xi32, #BL>
+    scf.yield %next_a_ptr, %next_b_ptr, %c : tensor<128x32x!tt.ptr<f16>, #AL>, tensor<32x128x!tt.ptr<f16>, #BL>, tensor<128x128xf32, #C>
+  }
+  tt.return %loop#2: tensor<128x128xf32, #C>
+}
+
+// Sub-element widths stay rejected even on sm75: contiguity-1 i8 loads
+// (8 bits) fall below the 16-bit profitability floor.
+// CHECK-LABEL: @sm75_subelement_load_not_pipelined
+// CHECK-NOT: tt.latency
+tt.func @sm75_subelement_load_not_pipelined(%lb : index, %ub : index, %step : index,
+                  %a_ptr_init : tensor<128x32x!tt.ptr<i8>, #AL>,
+                  %b_ptr_init : tensor<32x128x!tt.ptr<i8>, #BL>) -> tensor<128x128xi32, #C> {
+  %c_init = arith.constant dense<0> : tensor<128x128xi32, #C>
+  %a_off = arith.constant dense<4> : tensor<128x32xi32, #AL>
+  %b_off = arith.constant dense<4> : tensor<32x128xi32, #BL>
+  %loop:3 = scf.for %iv = %lb to %ub step %step iter_args(%a_ptr = %a_ptr_init, %b_ptr = %b_ptr_init, %prev_c = %c_init) -> (tensor<128x32x!tt.ptr<i8>, #AL>, tensor<32x128x!tt.ptr<i8>, #BL>, tensor<128x128xi32, #C>) {
+    %a_ = tt.load %a_ptr : tensor<128x32x!tt.ptr<i8>, #AL>
+    %a = ttg.convert_layout %a_ : tensor<128x32xi8, #AL> -> tensor<128x32xi8, #AI>
+    %b_ = tt.load %b_ptr : tensor<32x128x!tt.ptr<i8>, #BL>
+    %b = ttg.convert_layout %b_ : tensor<32x128xi8, #BL> -> tensor<32x128xi8, #BI>
+    %c = tt.dot %a, %b, %prev_c : tensor<128x32xi8, #AI> * tensor<32x128xi8, #BI> -> tensor<128x128xi32, #C>
+    %next_a_ptr = tt.addptr %a_ptr, %a_off : tensor<128x32x!tt.ptr<i8>, #AL>, tensor<128x32xi32, #AL>
+    %next_b_ptr = tt.addptr %b_ptr, %b_off : tensor<32x128x!tt.ptr<i8>, #BL>, tensor<32x128xi32, #BL>
+    scf.yield %next_a_ptr, %next_b_ptr, %c : tensor<128x32x!tt.ptr<i8>, #AL>, tensor<32x128x!tt.ptr<i8>, #BL>, tensor<128x128xi32, #C>
+  }
+  tt.return %loop#2: tensor<128x128xi32, #C>
+}
+}

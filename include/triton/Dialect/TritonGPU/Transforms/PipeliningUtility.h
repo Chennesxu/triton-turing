@@ -99,6 +99,11 @@ std::pair<Operation *, int64_t> getDefiningOpAndDistance(scf::ForOp forOp,
 int getCopyVecBytes(RankedTensorType registerTy,
                     gpu::SharedEncodingTrait sharedEnc);
 
+// Contiguous access width of the load in bits (pointer contiguity, capped by
+// mask alignment, times the element width).
+unsigned getLoadContiguousBits(
+    triton::LoadOp loadOp, triton::ModuleAxisInfoAnalysis &axisInfoAnalysis);
+
 bool canBeConvertedToAsyncLoad(
     triton::LoadOp loadOp, triton::ModuleAxisInfoAnalysis &axisInfoAnalysis);
 

@@ -71,7 +71,8 @@ public:
 
     llvm::MapVector<Operation *, std::pair<int, Operation *>> loadOpToIndLevel =
         loadOpsToIndirectionLevel(forOp, pipelineWithoutDot, axisInfoAnalysis,
-                                  numStages);
+                                  numStages, /*filterSmall=*/true,
+                                  computeCapability);
     if (loadOpToIndLevel.empty())
       return;
 
@@ -180,9 +181,18 @@ public:
   static bool
   isPipeliningBeneficial(Operation *op, Operation *finalUser,
                          tt::ModuleAxisInfoAnalysis &axisInfoAnalysis,
-                         bool filterSmall) {
+                         bool filterSmall, int computeCapability = 0) {
+    // The >= 4-byte floor below is cp.async's minimum transfer size. The
+    // sm75 synchronous copy path has no such hardware constraint, so on
+    // Turing only a profitability floor of one 16-bit element remains:
+    // pipelining strided fp16 loads (contiguity 1) is still worthwhile
+    // because their long latency is exactly what overlapping hides.
+    bool sm75SyncCopy = computeCapability == 75;
     if (auto loadOp = dyn_cast<tt::LoadOp>(op)) {
-      if (filterSmall && !canBeConvertedToAsyncLoad(loadOp, axisInfoAnalysis)) {
+      if (filterSmall &&
+          (sm75SyncCopy
+               ? getLoadContiguousBits(loadOp, axisInfoAnalysis) < 16
+               : !canBeConvertedToAsyncLoad(loadOp, axisInfoAnalysis))) {
         LDBG("Load " << *loadOp << " is too small for pipelining");
         return false;
       }
@@ -218,8 +228,9 @@ public:
     if (localAllocEnc) {
       auto registerTy = cast<RankedTensorType>(op->getResultTypes()[0]);
       auto vecBytes = getCopyVecBytes(registerTy, localAllocEnc);
-      if (filterSmall && vecBytes < 4) {
-        // At least 4 bytes need to be consecutive for cp.async
+      // At least 4 consecutive bytes for cp.async; the sm75 sync copy only
+      // needs a whole 16-bit element per st.shared.
+      if (filterSmall && vecBytes < (sm75SyncCopy ? 2 : 4)) {
         return false;
       }
     }
@@ -370,7 +381,8 @@ void assignLatencies(ModuleOp moduleOp, int defaultNumStages) {
 llvm::MapVector<Operation *, std::pair<int, Operation *>>
 loadOpsToIndirectionLevel(scf::ForOp forOp, bool pipelineWithoutDot,
                           tt::ModuleAxisInfoAnalysis &axisInfoAnalysis,
-                          int numStages, bool filterSmall) {
+                          int numStages, bool filterSmall,
+                          int computeCapability) {
   llvm::MapVector<Operation *, std::pair<int, Operation *>> loadOpToIndLevel;
   DenseSet<Operation *> seen;
   DenseSet<Operation *> excluded;
@@ -381,7 +393,8 @@ loadOpsToIndirectionLevel(scf::ForOp forOp, bool pipelineWithoutDot,
           return;
         if (isa<tt::LoadOp, tt::DescriptorLoadLikeOpInterface>(op)) {
           if (!AssignLoadLatencies::isPipeliningBeneficial(
-                  op, finalUser, axisInfoAnalysis, filterSmall))
+                  op, finalUser, axisInfoAnalysis, filterSmall,
+                  computeCapability))
             return;
           if (loadOpToIndLevel.count(op)) {
             int level = loadOpToIndLevel[op].first;
