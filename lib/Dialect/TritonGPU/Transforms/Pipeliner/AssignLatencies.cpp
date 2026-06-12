@@ -59,8 +59,10 @@ void assignUserProvidedLatencies(scf::ForOp forOp,
 class AssignLoadLatencies {
 public:
   AssignLoadLatencies(scf::ForOp forOp, int numStages,
-                      DenseMap<Operation *, int> &opLatency)
-      : forOp(forOp), numStages(numStages), opLatency(opLatency) {};
+                      DenseMap<Operation *, int> &opLatency,
+                      int computeCapability = 0)
+      : forOp(forOp), numStages(numStages), opLatency(opLatency),
+        computeCapability(computeCapability) {};
 
   void run() {
     bool pipelineWithoutDot = forOp->hasAttr(mlir::triton::kNumStagesAttrName);
@@ -79,6 +81,11 @@ public:
       maxIndirectionLevel = std::max(maxIndirectionLevel, info.first);
     unsigned loadLatency = (numStages - 1) / (maxIndirectionLevel + 1);
 
+    if (computeCapability == 75)
+      loadLatency = clampLatencyToSharedMemory(loadOpToIndLevel, loadLatency);
+    if (loadLatency == 0)
+      return;
+
     for (auto [loadOp, dist] : loadOpToIndLevel) {
       opLatency[loadOp] = loadLatency;
     }
@@ -88,6 +95,79 @@ private:
   scf::ForOp forOp;
   int numStages;
   DenseMap<Operation *, int> &opLatency;
+  int computeCapability;
+
+  // Turing kernels with fixed (non-autotuned) configs have no pruning safety
+  // net: if the pipeline multibuffers don't fit shared memory, compilation
+  // hard-fails with OutOfResources. Degrade gracefully instead. Each unit of
+  // load latency costs one buffer slot per load, so lower the latency until
+  // the estimated buffer footprint fits what is left of Turing's 64KB/CTA
+  // hard limit after subtracting shared memory the loop already commits to
+  // (e.g. loop-invariant dot operand staging), down to 0 (no pipelining),
+  // which leaves the loop as it would be without the pipeliner.
+  unsigned clampLatencyToSharedMemory(
+      const llvm::MapVector<Operation *, std::pair<int, Operation *>>
+          &loadOpToIndLevel,
+      unsigned loadLatency) {
+    constexpr int64_t kSm75SharedMemoryBudget = 64 * 1024;
+
+    int64_t bytesPerSlot = 0;
+    for (auto &[loadOp, info] : loadOpToIndLevel) {
+      auto tensorTy =
+          dyn_cast<RankedTensorType>(loadOp->getResultTypes().front());
+      if (!tensorTy)
+        continue;
+      bytesPerSlot += tensorBytes(tensorTy);
+    }
+    if (bytesPerSlot == 0)
+      return loadLatency;
+
+    // local_allocs live during the loop (defined inside, or defined outside
+    // with users inside) occupy shared memory concurrently with the pipeline
+    // buffers. Skip allocs that merely stage a pipelined load: the sync copy
+    // lowering folds those into the pipeline buffers, counting them twice
+    // would be wrong.
+    int64_t staticBytes = 0;
+    Operation *scope = forOp->getParentOfType<triton::FuncOp>();
+    if (!scope)
+      scope = forOp->getParentOfType<ModuleOp>();
+    scope->walk([&](ttg::LocalAllocOp alloc) {
+      if (alloc.getSrc())
+        if (Operation *def = alloc.getSrc().getDefiningOp())
+          if (loadOpToIndLevel.count(def))
+            return;
+      bool liveInLoop =
+          forOp->isAncestor(alloc) ||
+          llvm::any_of(alloc->getUsers(),
+                       [&](Operation *user) { return forOp->isAncestor(user); });
+      if (!liveInLoop)
+        return;
+      auto ty = alloc.getType();
+      int64_t elems = 1;
+      for (int64_t d : ty.getShape())
+        elems *= d;
+      int64_t elemBits = ty.getElementType().getIntOrFloatBitWidth();
+      staticBytes += elems * llvm::divideCeil(elemBits, 8);
+    });
+
+    int64_t budget = kSm75SharedMemoryBudget - staticBytes;
+    unsigned clamped = loadLatency;
+    while (clamped > 0 && bytesPerSlot * clamped > budget)
+      --clamped;
+    if (clamped != loadLatency)
+      LDBG("sm75: clamping load latency " << loadLatency << " -> " << clamped
+                                          << " (" << bytesPerSlot
+                                          << "B/slot, " << staticBytes
+                                          << "B static)");
+    return clamped;
+  }
+
+  static int64_t tensorBytes(RankedTensorType ty) {
+    Type elemTy = ty.getElementType();
+    int64_t elemBits =
+        elemTy.isIntOrFloat() ? elemTy.getIntOrFloatBitWidth() : 64;
+    return ty.getNumElements() * llvm::divideCeil(elemBits, 8);
+  }
 
 public:
   static bool canHaveSharedEncoding(tt::LoadOp op) {
@@ -260,6 +340,14 @@ void assignLatencies(ModuleOp moduleOp, int defaultNumStages) {
   if (loops.empty())
     return;
 
+  // The module may target another vendor or, in lit tests, carry no target
+  // attribute; both would assert in getNVIDIAComputeCapability. Treat them
+  // as "not sm75": the latency clamp below only applies to Turing.
+  int computeCapability = 0;
+  auto targetAttr = moduleOp->getAttrOfType<StringAttr>(AttrTargetName);
+  if (targetAttr && targetAttr.getValue().starts_with("cuda:"))
+    computeCapability = getNVIDIAComputeCapability(moduleOp);
+
   DenseMap<Operation *, int> opLatency;
   for (auto forOp : loops) {
     if (hasLatenciesAssigned(forOp)) {
@@ -267,7 +355,7 @@ void assignLatencies(ModuleOp moduleOp, int defaultNumStages) {
       continue;
     }
     int numStages = getNumStagesOrDefault(forOp, defaultNumStages);
-    AssignLoadLatencies(forOp, numStages, opLatency).run();
+    AssignLoadLatencies(forOp, numStages, opLatency, computeCapability).run();
     AssignMMALatencies(forOp, opLatency).run();
   }
   serializeLatencies(moduleOp, opLatency);

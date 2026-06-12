@@ -586,6 +586,17 @@ class _attention(torch.autograd.Function):
         PRE_BLOCK = 128
         NUM_WARPS, NUM_STAGES = 4, 5
         BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 32, 128, 128, 32
+        if is_cuda() and torch.cuda.get_device_capability() == (7, 5):
+            # Turing: 64KB shared memory per CTA (Ampere+: >= 100KB). At
+            # HEAD_DIM=128 the dot operand staging of the upstream block
+            # sizes alone needs ~80KB, so halve the K/V (resp. Q) row blocks
+            # and skip pipelining. At HEAD_DIM=64 the upstream blocks fit
+            # with a double-buffered pipeline.
+            if ctx.HEAD_DIM <= 64:
+                NUM_STAGES = 2
+            else:
+                NUM_STAGES = 1
+                BLOCK_N1, BLOCK_M2 = 64, 64
         BLK_SLICE_FACTOR = 2
         RCP_LN2 = 1.4426950408889634  # = 1.0 / ln(2)
         arg_k = k

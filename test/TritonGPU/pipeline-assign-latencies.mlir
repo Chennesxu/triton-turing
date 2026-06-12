@@ -1201,3 +1201,126 @@ tt.func @tc_gen5_mma_alloc_block_arg(%lb : index, %ub : index, %step : index,
   tt.return
 }
 }
+
+// -----
+
+#AL = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#BL = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+#C = #ttg.nvidia_mma<{versionMajor = 2, warpsPerCTA = [4, 1], instrShape = [16, 8]}>
+#A = #ttg.dot_op<{opIdx = 0, parent = #C, kWidth=2}>
+#B = #ttg.dot_op<{opIdx = 1, parent = #C, kWidth=2}>
+
+// On sm75 the pipeline multibuffers must fit the 64KB/CTA hard limit; the
+// assigned latency (one buffer slot per unit) is clamped to whatever fits,
+// down to no pipelining at all. Non-Turing modules are unaffected (the
+// existing tests above carry no ttg.target).
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32, ttg.target = "cuda:75"} {
+// 128x32 + 32x128 fp16 = 16KB per slot; latency 2 needs 32KB: fits, no clamp.
+// CHECK-LABEL: @sm75_within_budget
+tt.func @sm75_within_budget(%lb : index, %ub : index, %step : index,
+                  %a_ptr_init : tensor<128x32x!tt.ptr<f16>, #AL> {tt.divisibility = dense<[16, 16]> : tensor<2xi32>, tt.contiguity = dense<[1, 32]> : tensor<2xi32>},
+                  %b_ptr_init : tensor<32x128x!tt.ptr<f16>, #BL> {tt.divisibility = dense<[16, 16]> : tensor<2xi32>, tt.contiguity = dense<[1, 32]> : tensor<2xi32>}) -> tensor<128x128xf32, #C> {
+  %c_init = arith.constant dense<0.00e+00> : tensor<128x128xf32, #C>
+  %a_off = arith.constant dense<4> : tensor<128x32xi32, #AL>
+  %b_off = arith.constant dense<4> : tensor<32x128xi32, #BL>
+  %loop:3 = scf.for %iv = %lb to %ub step %step iter_args(%a_ptr = %a_ptr_init, %b_ptr = %b_ptr_init, %prev_c = %c_init) -> (tensor<128x32x!tt.ptr<f16>, #AL>, tensor<32x128x!tt.ptr<f16>, #BL>, tensor<128x128xf32, #C>) {
+    // CHECK: tt.load {{.*}} {tt.latency = 2 : i32}
+    %a_ = tt.load %a_ptr : tensor<128x32x!tt.ptr<f16>, #AL>
+    %a = ttg.convert_layout %a_ : tensor<128x32xf16, #AL> -> tensor<128x32xf16, #A>
+    // CHECK: tt.load {{.*}} {tt.latency = 2 : i32}
+    %b_ = tt.load %b_ptr : tensor<32x128x!tt.ptr<f16>, #BL>
+    %b = ttg.convert_layout %b_ : tensor<32x128xf16, #BL> -> tensor<32x128xf16, #B>
+    %c = tt.dot %a, %b, %prev_c : tensor<128x32xf16, #A> * tensor<32x128xf16, #B> -> tensor<128x128xf32, #C>
+    %next_a_ptr = tt.addptr %a_ptr, %a_off : tensor<128x32x!tt.ptr<f16>, #AL>, tensor<128x32xi32, #AL>
+    %next_b_ptr = tt.addptr %b_ptr, %b_off : tensor<32x128x!tt.ptr<f16>, #BL>, tensor<32x128xi32, #BL>
+    scf.yield %next_a_ptr, %next_b_ptr, %c : tensor<128x32x!tt.ptr<f16>, #AL>, tensor<32x128x!tt.ptr<f16>, #BL>, tensor<128x128xf32, #C>
+  }
+  tt.return %loop#2: tensor<128x128xf32, #C>
+}
+
+// 128x128 + 128x128 fp16 = 64KB per slot; latency 2 needs 128KB: clamp to 1.
+// CHECK-LABEL: @sm75_clamp_to_one
+tt.func @sm75_clamp_to_one(%lb : index, %ub : index, %step : index,
+                  %a_ptr_init : tensor<128x128x!tt.ptr<f16>, #AL> {tt.divisibility = dense<[16, 16]> : tensor<2xi32>, tt.contiguity = dense<[1, 32]> : tensor<2xi32>},
+                  %b_ptr_init : tensor<128x128x!tt.ptr<f16>, #BL> {tt.divisibility = dense<[16, 16]> : tensor<2xi32>, tt.contiguity = dense<[1, 32]> : tensor<2xi32>}) -> tensor<128x128xf32, #C> {
+  %c_init = arith.constant dense<0.00e+00> : tensor<128x128xf32, #C>
+  %a_off = arith.constant dense<4> : tensor<128x128xi32, #AL>
+  %b_off = arith.constant dense<4> : tensor<128x128xi32, #BL>
+  %loop:3 = scf.for %iv = %lb to %ub step %step iter_args(%a_ptr = %a_ptr_init, %b_ptr = %b_ptr_init, %prev_c = %c_init) -> (tensor<128x128x!tt.ptr<f16>, #AL>, tensor<128x128x!tt.ptr<f16>, #BL>, tensor<128x128xf32, #C>) {
+    // CHECK: tt.load {{.*}} {tt.latency = 1 : i32}
+    %a_ = tt.load %a_ptr : tensor<128x128x!tt.ptr<f16>, #AL>
+    %a = ttg.convert_layout %a_ : tensor<128x128xf16, #AL> -> tensor<128x128xf16, #A>
+    // CHECK: tt.load {{.*}} {tt.latency = 1 : i32}
+    %b_ = tt.load %b_ptr : tensor<128x128x!tt.ptr<f16>, #BL>
+    %b = ttg.convert_layout %b_ : tensor<128x128xf16, #BL> -> tensor<128x128xf16, #B>
+    %c = tt.dot %a, %b, %prev_c : tensor<128x128xf16, #A> * tensor<128x128xf16, #B> -> tensor<128x128xf32, #C>
+    %next_a_ptr = tt.addptr %a_ptr, %a_off : tensor<128x128x!tt.ptr<f16>, #AL>, tensor<128x128xi32, #AL>
+    %next_b_ptr = tt.addptr %b_ptr, %b_off : tensor<128x128x!tt.ptr<f16>, #BL>, tensor<128x128xi32, #BL>
+    scf.yield %next_a_ptr, %next_b_ptr, %c : tensor<128x128x!tt.ptr<f16>, #AL>, tensor<128x128x!tt.ptr<f16>, #BL>, tensor<128x128xf32, #C>
+  }
+  tt.return %loop#2: tensor<128x128xf32, #C>
+}
+
+// 256x128 + 128x256 fp16 = 128KB per slot: even a single slot cannot fit,
+// no latency is assigned and the loop is left unpipelined.
+// CHECK-LABEL: @sm75_clamp_to_zero
+// CHECK-NOT: tt.latency
+tt.func @sm75_clamp_to_zero(%lb : index, %ub : index, %step : index,
+                  %a_ptr_init : tensor<256x128x!tt.ptr<f16>, #AL> {tt.divisibility = dense<[16, 16]> : tensor<2xi32>, tt.contiguity = dense<[1, 32]> : tensor<2xi32>},
+                  %b_ptr_init : tensor<128x256x!tt.ptr<f16>, #BL> {tt.divisibility = dense<[16, 16]> : tensor<2xi32>, tt.contiguity = dense<[1, 32]> : tensor<2xi32>}) -> tensor<256x256xf32, #C> {
+  %c_init = arith.constant dense<0.00e+00> : tensor<256x256xf32, #C>
+  %a_off = arith.constant dense<4> : tensor<256x128xi32, #AL>
+  %b_off = arith.constant dense<4> : tensor<128x256xi32, #BL>
+  %loop:3 = scf.for %iv = %lb to %ub step %step iter_args(%a_ptr = %a_ptr_init, %b_ptr = %b_ptr_init, %prev_c = %c_init) -> (tensor<256x128x!tt.ptr<f16>, #AL>, tensor<128x256x!tt.ptr<f16>, #BL>, tensor<256x256xf32, #C>) {
+    %a_ = tt.load %a_ptr : tensor<256x128x!tt.ptr<f16>, #AL>
+    %a = ttg.convert_layout %a_ : tensor<256x128xf16, #AL> -> tensor<256x128xf16, #A>
+    %b_ = tt.load %b_ptr : tensor<128x256x!tt.ptr<f16>, #BL>
+    %b = ttg.convert_layout %b_ : tensor<128x256xf16, #BL> -> tensor<128x256xf16, #B>
+    %c = tt.dot %a, %b, %prev_c : tensor<256x128xf16, #A> * tensor<128x256xf16, #B> -> tensor<256x256xf32, #C>
+    %next_a_ptr = tt.addptr %a_ptr, %a_off : tensor<256x128x!tt.ptr<f16>, #AL>, tensor<256x128xi32, #AL>
+    %next_b_ptr = tt.addptr %b_ptr, %b_off : tensor<128x256x!tt.ptr<f16>, #BL>, tensor<128x256xi32, #BL>
+    scf.yield %next_a_ptr, %next_b_ptr, %c : tensor<256x128x!tt.ptr<f16>, #AL>, tensor<128x256x!tt.ptr<f16>, #BL>, tensor<256x256xf32, #C>
+  }
+  tt.return %loop#2: tensor<256x256xf32, #C>
+}
+}
+
+// -----
+
+#AL = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#BL = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+#C = #ttg.nvidia_mma<{versionMajor = 2, warpsPerCTA = [4, 1], instrShape = [16, 8]}>
+#A = #ttg.dot_op<{opIdx = 0, parent = #C, kWidth=2}>
+#B = #ttg.dot_op<{opIdx = 1, parent = #C, kWidth=2}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32, ttg.target = "cuda:75"} {
+// Shared memory already committed to allocs that live across the loop (here
+// 32KB + 16KB scratch buffers used inside) shrinks the pipeline budget: 16KB
+// per slot only fits once in the remaining 16KB, so latency 2 clamps to 1.
+// CHECK-LABEL: @sm75_static_alloc_shrinks_budget
+tt.func @sm75_static_alloc_shrinks_budget(%lb : index, %ub : index, %step : index,
+                  %a_ptr_init : tensor<128x32x!tt.ptr<f16>, #AL> {tt.divisibility = dense<[16, 16]> : tensor<2xi32>, tt.contiguity = dense<[1, 32]> : tensor<2xi32>},
+                  %b_ptr_init : tensor<32x128x!tt.ptr<f16>, #BL> {tt.divisibility = dense<[16, 16]> : tensor<2xi32>, tt.contiguity = dense<[1, 32]> : tensor<2xi32>}) -> tensor<128x128xf32, #C> {
+  %c_init = arith.constant dense<0.00e+00> : tensor<128x128xf32, #C>
+  %a_off = arith.constant dense<4> : tensor<128x32xi32, #AL>
+  %b_off = arith.constant dense<4> : tensor<32x128xi32, #BL>
+  %scratch1 = ttg.local_alloc : () -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+  %scratch2 = ttg.local_alloc : () -> !ttg.memdesc<64x128xf16, #shared, #smem, mutable>
+  %loop:3 = scf.for %iv = %lb to %ub step %step iter_args(%a_ptr = %a_ptr_init, %b_ptr = %b_ptr_init, %prev_c = %c_init) -> (tensor<128x32x!tt.ptr<f16>, #AL>, tensor<32x128x!tt.ptr<f16>, #BL>, tensor<128x128xf32, #C>) {
+    // CHECK: tt.load {{.*}} {tt.latency = 1 : i32}
+    %a_ = tt.load %a_ptr : tensor<128x32x!tt.ptr<f16>, #AL>
+    %a = ttg.convert_layout %a_ : tensor<128x32xf16, #AL> -> tensor<128x32xf16, #A>
+    // CHECK: tt.load {{.*}} {tt.latency = 1 : i32}
+    %b_ = tt.load %b_ptr : tensor<32x128x!tt.ptr<f16>, #BL>
+    %b = ttg.convert_layout %b_ : tensor<32x128xf16, #BL> -> tensor<32x128xf16, #B>
+    %c = tt.dot %a, %b, %prev_c : tensor<128x32xf16, #A> * tensor<32x128xf16, #B> -> tensor<128x128xf32, #C>
+    "use"(%scratch1, %scratch2) : (!ttg.memdesc<128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<64x128xf16, #shared, #smem, mutable>) -> ()
+    %next_a_ptr = tt.addptr %a_ptr, %a_off : tensor<128x32x!tt.ptr<f16>, #AL>, tensor<128x32xi32, #AL>
+    %next_b_ptr = tt.addptr %b_ptr, %b_off : tensor<32x128x!tt.ptr<f16>, #BL>, tensor<32x128xi32, #BL>
+    scf.yield %next_a_ptr, %next_b_ptr, %c : tensor<128x32x!tt.ptr<f16>, #AL>, tensor<32x128x!tt.ptr<f16>, #BL>, tensor<128x128xf32, #C>
+  }
+  tt.return %loop#2: tensor<128x128xf32, #C>
+}
+}
