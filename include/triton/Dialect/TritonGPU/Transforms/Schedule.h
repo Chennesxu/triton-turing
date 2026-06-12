@@ -23,7 +23,8 @@ bool isSafeToPipeline(scf::ForOp forOp);
 llvm::MapVector<Operation *, std::pair<int, Operation *>>
 loadOpsToIndirectionLevel(scf::ForOp forOp, bool pipelineWithoutDot,
                           triton::ModuleAxisInfoAnalysis &axisInfoAnalysis,
-                          int numStages, bool filterSmall = true);
+                          int numStages, bool filterSmall = true,
+                          int computeCapability = 0);
 
 }; // namespace gpu
 

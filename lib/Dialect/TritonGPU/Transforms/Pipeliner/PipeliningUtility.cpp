@@ -294,7 +294,7 @@ int mlir::triton::getCopyVecBytes(RankedTensorType registerTy,
   return vecElems * registerTy.getElementTypeBitWidth() / 8;
 }
 
-bool mlir::triton::canBeConvertedToAsyncLoad(
+unsigned mlir::triton::getLoadContiguousBits(
     tt::LoadOp loadOp, tt::ModuleAxisInfoAnalysis &axisInfoAnalysis) {
   auto ptr = loadOp.getPtr();
   unsigned vec = axisInfoAnalysis.getContiguity(ptr);
@@ -302,21 +302,23 @@ bool mlir::triton::canBeConvertedToAsyncLoad(
     vec = std::min<unsigned>(vec, axisInfoAnalysis.getMaskAlignment(mask));
 
   auto tensorTy = dyn_cast<RankedTensorType>(ptr.getType());
-  unsigned width = 0;
   if (tensorTy) {
     auto ty = cast<tt::PointerType>(tensorTy.getElementType()).getPointeeType();
-    width = vec * ty.getIntOrFloatBitWidth();
-  } else {
-    width = cast<tt::PointerType>(ptr.getType())
-                .getPointeeType()
-                .getIntOrFloatBitWidth();
+    return vec * ty.getIntOrFloatBitWidth();
   }
+  return cast<tt::PointerType>(ptr.getType())
+      .getPointeeType()
+      .getIntOrFloatBitWidth();
+}
 
+bool mlir::triton::canBeConvertedToAsyncLoad(
+    tt::LoadOp loadOp, tt::ModuleAxisInfoAnalysis &axisInfoAnalysis) {
   // We do not pipeline all loads for the following reasons:
   // 1. On nvidia GPUs, cp.async's cp-size can only be 4, 8, or 16.
   // 2. It's likely that pipling small loads won't offer much performance
   //    improvement and may even hurt performance by increasing register
   //    pressure.
+  unsigned width = getLoadContiguousBits(loadOp, axisInfoAnalysis);
   LDBG("Load " << *loadOp << " has width " << width);
   return width >= 32;
 }
