@@ -222,7 +222,12 @@ def get_turing_autotune_config():
     # and stages shallow instead, and includes deep-K single-stage points
     # (the cudaTensorCoreGemm design: amortize barriers over a deep chunk).
     sizes = [
-        # large tiles, shallow pipeline
+        # large tiles. On large square GEMM the sync-copy pipeline is a net
+        # loss: the kernel is compute-bound (Tensor Core ~71% even at s1) and
+        # load latency is already hidden by ptxas register-level scheduling, so
+        # the single-buffer num_stages=1 point below wins (~+5% vs s3). The
+        # s2/s3 variants stay for smaller/latency-exposed shapes.
+        {'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'num_stages': 1, 'num_warps': 4},
         {'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'num_stages': 2, 'num_warps': 4},
         {'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'num_stages': 3, 'num_warps': 4},
         {'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'num_stages': 2, 'num_warps': 8},
