@@ -70,7 +70,7 @@ def run_and_check(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, num_stages, device,
         c = torch.empty((M, N), device=device, dtype=torch.float32)
         ref_dtype = torch.float64
     grid = (M // BLOCK_M, N // BLOCK_N)
-    matmul_padded_kernel[grid](
+    compiled = matmul_padded_kernel[grid](
         a, b, c, M, N, K,  #
         a.stride(0), a.stride(1), b.stride(0), b.stride(1),  #
         c.stride(0), c.stride(1),  #
@@ -79,6 +79,13 @@ def run_and_check(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, num_stages, device,
         IS_INT8=is_int8,  #
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,  #
         num_stages=num_stages)
+
+    # Numerical correctness alone can't tell a Tensor Core dot from an FMA
+    # fallback, so on Turing pin the int8 path to the actual m8n8k16 imma
+    # instruction. K=0 compiles the loop away (no dot), so skip that case.
+    if is_int8 and K > 0 and torch.cuda.get_device_capability() == (7, 5):
+        assert "mma.sync.aligned.m8n8k16.row.col.satfinite.s32.s8.s8.s32" \
+            in compiled.asm["ptx"], "int8 dot did not lower to the m8n8k16 Tensor Core path"
 
     # The kernel pads the last partial K tile with A_OTHER/B_OTHER via the
     # load masks; replicate that padding exactly in the reference. int64
@@ -102,10 +109,11 @@ def run_and_check(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, num_stages, device,
 # Trip counts around and below the pipeline depth: the prologue prefetches
 # num_stages-1 tiles unconditionally (mask-predicated), so loops shorter than
 # the pipeline exercise stores of masked-off stages and epilogue draining.
-# K=33 adds a ragged final tile on top of a tiny trip count.
+# K=33 adds a ragged final tile on top of a tiny trip count. num_stages=1 is
+# the single-buffer (no pipeline) baseline.
 @pytest.mark.parametrize("dtype", ["fp16", "int8"])
 @pytest.mark.parametrize("K", [0, 16, 32, 33, 64, 96, 160])
-@pytest.mark.parametrize("num_stages", [2, 3, 4])
+@pytest.mark.parametrize("num_stages", [1, 2, 3, 4])
 def test_edge_trip_counts(K, num_stages, dtype, device):
     run_and_check(64, 64, K, 64, 64, 32, num_stages, device, dtype=dtype)
 
@@ -116,7 +124,7 @@ def test_edge_trip_counts(K, num_stages, dtype, device):
 # that), so even num_stages=5 fits Turing's 64KB/CTA. Multiple CTAs via a
 # 2x2 grid.
 @pytest.mark.parametrize("dtype", ["fp16", "int8"])
-@pytest.mark.parametrize("num_stages", [2, 3, 4, 5])
+@pytest.mark.parametrize("num_stages", [1, 2, 3, 4, 5])
 def test_multibuffer_slot_rotation(num_stages, dtype, device):
     run_and_check(128, 128, 640, 64, 64, 32, num_stages, device, dtype=dtype)
 
@@ -127,7 +135,7 @@ def test_multibuffer_slot_rotation(num_stages, dtype, device):
 # replicated exactly by the padded reference.
 @pytest.mark.parametrize("dtype", ["fp16", "int8"])
 @pytest.mark.parametrize("K", [33, 80])
-@pytest.mark.parametrize("num_stages", [2, 3])
+@pytest.mark.parametrize("num_stages", [1, 2, 3])
 def test_masked_load_nonzero_other(K, num_stages, dtype, device):
     run_and_check(64, 64, K, 64, 64, 32, num_stages, device,
                   a_other=3.0, b_other=2.0, dtype=dtype)
