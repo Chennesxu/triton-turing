@@ -25,6 +25,9 @@ def min_dot_size(target: GPUTarget):
         # For small M/N the input we can still use tensorcores with padding.
         if lhs_bitwidth == 8:
             return (1, 1, 32)
+        elif lhs_bitwidth == 4:
+            # Turing int4 m8n8k32: native K-tile is 256/4 = 64.
+            return (1, 1, 64)
         elif lhs_bitwidth == 64:
             return (1, 1, 4)
         elif lhs_bitwidth == 32:

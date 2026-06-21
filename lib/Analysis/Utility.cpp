@@ -1256,7 +1256,8 @@ bool supportMMA(Value value, int version) {
                          Float8E4M3FNUZType>(elemTy);
   return isFP8 || elemTy.isF16() || elemTy.isBF16() ||
          ((elemTy.isF32() || elemTy.isF64()) && version >= 2) ||
-         (elemTy.isInteger(8) && version >= 2);
+         (elemTy.isInteger(8) && version >= 2) ||
+         (elemTy.isInteger(4) && version >= 2);
 }
 
 // We get the smallest submap of srcTy^{-1} * dstTy that is not the identity
