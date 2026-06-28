@@ -367,6 +367,42 @@ static MMAEncodingResult createMMAEncodingForDot(DotOpInterface dotOp,
 static Value convertDotOperandForMMA(Value v, int opIdx, int bitwidth,
                                      RankedTensorType newRetType,
                                      PatternRewriter &rewriter) {
+  // int4 path: the operand is `reinterpret_as_int4(%packed_i32)`. We cannot
+  // give the i4 tensor a dot-operand layout directly, because that needs a
+  // blocked->dot_op convert_layout on i4, which would route through shared
+  // memory — illegal (i4 local_alloc requires an 8-bit-multiple element width).
+  // Instead, apply the dot-operand layout to the int32 SOURCE (kWidth=1, legal
+  // for 32-bit), then re-create the reinterpret on top so the i4 tensor only
+  // ever exists in dot-operand form (kWidth=8). The reinterpret is a pure
+  // register relabel: 4x i32 == 32x i4 == 128 bits per thread.
+  //
+  // The operand may be wrapped in convert_layout ops inserted while giving the
+  // reinterpret result a dot-operand encoding; look through them to the
+  // reinterpret.
+  Value reintVal = v;
+  while (auto cvt = reintVal.getDefiningOp<ConvertLayoutOp>())
+    reintVal = cvt.getSrc();
+  if (auto reint = reintVal.getDefiningOp<triton::ReinterpretAsInt4Op>()) {
+    Value packed = reint.getSrc();
+    auto packedType = cast<RankedTensorType>(packed.getType());
+    auto i32Type = rewriter.getIntegerType(32);
+    auto i4Type = rewriter.getIntegerType(4);
+    // int32 dot-operand encoding (kWidth derives to 1).
+    auto i32Encoding = DotOperandEncodingAttr::get(
+        v.getContext(), opIdx, newRetType.getEncoding(), i32Type);
+    auto i32DotType = packedType.cloneWithEncoding(i32Encoding);
+    Value i32Dot =
+        ConvertLayoutOp::create(rewriter, packed.getLoc(), i32DotType, packed);
+    // int4 dot-operand encoding (kWidth derives to 8); shape is the original
+    // unpacked i4 shape carried by the reinterpret result.
+    auto i4Encoding = DotOperandEncodingAttr::get(
+        v.getContext(), opIdx, newRetType.getEncoding(), i4Type);
+    auto i4DotType =
+        cast<RankedTensorType>(reint.getType()).cloneWithEncoding(i4Encoding);
+    return triton::ReinterpretAsInt4Op::create(rewriter, reint.getLoc(),
+                                               i4DotType, i32Dot,
+                                               reint.getAxis());
+  }
   auto minType = bitwidth > 0 ? rewriter.getIntegerType(bitwidth) : v.getType();
   auto vType = cast<RankedTensorType>(v.getType());
   auto newVEncoding = DotOperandEncodingAttr::get(

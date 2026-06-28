@@ -489,6 +489,7 @@ void populateTritonPatterns(TritonGPUTypeConverter &typeConverter,
       // clang-format off
       GenericOpPattern<triton::ReshapeOp>,
       GenericOpPattern<triton::BitcastOp>,
+      GenericOpPattern<triton::ReinterpretAsInt4Op>,
       GenericOpPattern<triton::FpToFpOp>,
       GenericOpPattern<triton::IntToPtrOp>,
       GenericOpPattern<triton::PtrToIntOp>,

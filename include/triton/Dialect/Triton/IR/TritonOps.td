@@ -81,6 +81,28 @@ def TT_BitcastOp : TT_Op<"bitcast", [Elementwise,
     let hasVerifier = 1;
 }
 
+// Reinterpret a packed int32 tensor as int4, expanding dimension `axis` by 8.
+// Each int32 holds 8 signed 4-bit values (LSB-first). Unlike bitcast this
+// changes both shape (axis dim x8) and element width, so it does NOT carry the
+// SameOperandsAndResultShape/Encoding traits. The result is bit-identical to
+// the source at the register level under an i4 dot-operand layout (kWidth=8):
+// 8 contiguous-K int4 occupy the same 32 bits as the source int32.
+// `axis` is the contraction (K) dimension: for a left operand [M, K/8] axis=1;
+// for a right operand [K/8, N] axis=0 — this lets the K dimension land in the
+// position the dot expects without an i4 transpose (which would require an i4
+// shared-memory allocation, illegal since shared element width must be a
+// multiple of 8). Feeds Turing s4 Tensor Cores (mma.m8n8k32).
+def TT_ReinterpretAsInt4Op : TT_Op<"reinterpret_as_int4", [Pure]> {
+    let summary = "Reinterpret a packed int32 tensor as unpacked int4";
+
+    let arguments = (ins TT_IntTensor:$src, I32Attr:$axis);
+
+    let results = (outs TT_IntTensor:$result);
+
+    let assemblyFormat = "$src attr-dict `:` type($src) `->` type($result)";
+    let hasVerifier = 1;
+}
+
 def TT_FpToFpOp : TT_Op<"fp_to_fp", [Elementwise,
                                      SameOperandsAndResultShape,
                                      SameOperandsAndResultEncoding,

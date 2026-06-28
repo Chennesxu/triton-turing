@@ -388,7 +388,7 @@ def check_bit_width(value, shift_value):
 
 
 class dtype(base_type):
-    SINT_TYPES = ['int8', 'int16', 'int32', 'int64']
+    SINT_TYPES = ['int4', 'int8', 'int16', 'int32', 'int64']
     UINT_TYPES = ['int1', 'uint8', 'uint16', 'uint32', 'uint64']
     FP_TYPES = ['fp8e4b15', 'fp8e4nv', 'fp8e4b8', 'fp8e5', 'fp8e5b16', 'fp16', 'bf16', 'fp32', 'fp64']
     STANDARD_FP_TYPES = ['fp16', 'bf16', 'fp32', 'fp64']
@@ -478,6 +478,9 @@ class dtype(base_type):
 
     def is_int1(self):
         return self.name == 'int1'
+
+    def is_int4(self):
+        return self.name == 'int4'
 
     def is_int8(self):
         return self.name == 'int8'
@@ -591,6 +594,8 @@ class dtype(base_type):
             return builder.get_void_ty()
         elif self.name == 'int1':
             return builder.get_int1_ty()
+        elif self.name == 'int4':
+            return builder.get_int4_ty()
         elif self.name in ('int8', 'uint8'):
             return builder.get_int8_ty()
         elif self.name in ('int16', 'uint16'):
@@ -806,6 +811,7 @@ class slice_type(dtype):
 # scalar types
 void = dtype('void')
 int1 = dtype('int1')
+int4 = dtype('int4')
 int8 = dtype('int8')
 int16 = dtype('int16')
 int32 = dtype('int32')
@@ -2347,6 +2353,31 @@ def cast(input, dtype: dtype, fp_downcast_rounding: Optional[str] = None, bitcas
 # -----------------------
 # Linear Algebra
 # -----------------------
+
+
+@builtin
+def reinterpret_as_int4(input, axis=-1, _semantic=None):
+    """
+    Reinterpret a packed int32 tensor as an unpacked int4 tensor, expanding
+    dimension :code:`axis` by 8 (each int32 holds 8 signed 4-bit values,
+    LSB-first).
+
+    int4 has no PyTorch storage type, so int4 matrix-multiply operands are
+    supplied as int32 tensors with the contraction (K) dimension packed by 8 and
+    reinterpreted to int4 immediately before :code:`tl.dot`. This is a
+    register-level relabel only: the int32 bits are fed unchanged into the int4
+    Tensor Core path (Turing m8n8k32).
+
+    :code:`axis` is the contraction dimension to expand: the left operand
+    [M, K // 8] uses axis=1 (the default last axis); the right operand
+    [K // 8, N] uses axis=0, so the K dimension lands where the dot expects it
+    without an i4 transpose.
+
+    :param input: an int32 tensor with the packed K // 8 along :code:`axis`.
+    :param axis: the dimension to expand by 8.
+    """
+    axis = _unwrap_if_constexpr(axis)
+    return _semantic.reinterpret_as_int4(input, axis)
 
 
 @builtin
