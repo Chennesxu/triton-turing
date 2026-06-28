@@ -998,6 +998,10 @@ void init_triton_ir(py::module &&m) {
            [](TritonOpBuilder &self) -> Type {
              return self.getBuilder().getI1Type();
            }) // or ret::copy?
+      .def("get_int4_ty",
+           [](TritonOpBuilder &self) -> Type {
+             return self.getBuilder().getIntegerType(4);
+           })
       .def("get_int8_ty",
            [](TritonOpBuilder &self) -> Type {
              return self.getBuilder().getI8Type();
@@ -1206,6 +1210,11 @@ void init_triton_ir(py::module &&m) {
       .def("create_bitcast",
            [](TritonOpBuilder &self, Value &src, Type &dstType) -> Value {
              return self.create<BitcastOp>(dstType, src);
+           })
+      .def("create_reinterpret_as_int4",
+           [](TritonOpBuilder &self, Value &src, Type &dstType,
+              int32_t axis) -> Value {
+             return self.create<ReinterpretAsInt4Op>(dstType, src, axis);
            })
       .def("create_si_to_fp",
            [](TritonOpBuilder &self, Value &src, Type &dstType) -> Value {

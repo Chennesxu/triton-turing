@@ -17,6 +17,7 @@ add_triton_library(TritonNVIDIAGPUToLLVM
     PTXAsmFormat.cpp
     Utility.cpp
     Fp4ToFpOpToLLVM.cpp
+    ReinterpretAsInt4OpToLLVM.cpp
     TargetInfo.cpp
     Allocation.cpp
 

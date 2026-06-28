@@ -335,6 +335,7 @@ static Type getMmaRetType(TensorCoreType mmaType, MLIRContext *ctx) {
   case TensorCoreType::FP16_FP8E4M3FN_FP8E4M3FN_FP16:
     return fp16x2Pack2Ty;
   case TensorCoreType::INT32_INT8_INT8_INT32:
+  case TensorCoreType::INT32_INT4_INT4_INT32:
     return i32x4Ty;
   case TensorCoreType::FP64_FP64_FP64_FP64:
     return fp64x2Ty;
@@ -411,6 +412,9 @@ static TensorCoreType getMmaTypeDot(DotOp op, RankedTensorType aTy,
   } else if (dTy.getElementType().isInteger(32)) {
     if (aTy.getElementType().isInteger(8) && bTy.getElementType().isInteger(8))
       return TensorCoreType::INT32_INT8_INT8_INT32;
+    // Turing s4 x s4 -> s32 via m8n8k32 (8 int4 packed per 32-bit register).
+    if (aTy.getElementType().isInteger(4) && bTy.getElementType().isInteger(4))
+      return TensorCoreType::INT32_INT4_INT4_INT32;
   } else if (dTy.getElementType().isF16()) {
     if (aTy.getElementType().isF16() && bTy.getElementType().isF16())
       return TensorCoreType::FP16_FP16_FP16_FP16;
@@ -440,6 +444,9 @@ inline static const std::map<TensorCoreType, std::string> mmaInstrPtxTuring = {
 
     {TensorCoreType::INT32_INT8_INT8_INT32,
      "mma.sync.aligned.m8n8k16.row.col.satfinite.s32.s8.s8.s32"},
+
+    {TensorCoreType::INT32_INT4_INT4_INT32,
+     "mma.sync.aligned.m8n8k32.row.col.satfinite.s32.s4.s4.s32"},
 
     {TensorCoreType::FP16_FP16_FP16_FP16,
      "mma.sync.aligned.m16n8k8.row.col.f16.f16.f16.f16"},

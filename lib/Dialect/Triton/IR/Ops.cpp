@@ -1084,6 +1084,42 @@ LogicalResult BitcastOp::verify() {
   return success();
 }
 
+//-- ReinterpretAsInt4Op --
+LogicalResult ReinterpretAsInt4Op::verify() {
+  auto srcTy = dyn_cast<RankedTensorType>(getSrc().getType());
+  auto dstTy = dyn_cast<RankedTensorType>(getType());
+  if (!srcTy || !dstTy)
+    return emitError("reinterpret_as_int4 requires ranked tensor operands");
+  if (!srcTy.getElementType().isInteger(32))
+    return emitError("source element type must be i32");
+  if (!dstTy.getElementType().isInteger(4))
+    return emitError("result element type must be i4");
+  auto srcShape = srcTy.getShape();
+  auto dstShape = dstTy.getShape();
+  if (srcShape.size() != dstShape.size())
+    return emitError("source and result must have the same rank");
+  int64_t axis = getAxis();
+  if (axis < 0 || axis >= static_cast<int64_t>(srcShape.size()))
+    return emitError("axis ") << axis << " out of range for rank "
+                              << srcShape.size();
+  // The `axis` (K) dimension expands by 8 (8 int4 packed per int32); all other
+  // dimensions are unchanged.
+  for (size_t i = 0; i < srcShape.size(); ++i) {
+    if (static_cast<int64_t>(i) == axis)
+      continue;
+    if (srcShape[i] != dstShape[i])
+      return emitError("non-K dimensions must match");
+  }
+  if (dstShape[axis] != srcShape[axis] * 8)
+    return emitError("axis dimension must expand by 8 (got ")
+           << srcShape[axis] << " -> " << dstShape[axis] << ")";
+  // NOTE: encoding consistency (source int32 dot-operand kWidth=1, result int4
+  // dot-operand kWidth=8) is established and guaranteed by the AccelerateMatmul
+  // interception that creates these ops; it cannot be checked here because the
+  // Triton dialect must not depend on TritonGPU's DotOperandEncodingAttr.
+  return success();
+}
+
 //-- BroadcastOp --
 void BroadcastOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                               MLIRContext *context) {
