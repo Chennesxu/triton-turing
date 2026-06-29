@@ -2,21 +2,19 @@
 
 **Triton-Turing** is a community-maintained fork of [Triton](https://github.com/triton-lang/triton) focused on restoring high-performance Tensor Core support for NVIDIA Turing GPUs (SM75: RTX 2080 Ti, Titan RTX).
 
-Upstream Triton supports Turing's MMA instructions, but critical optimizations were gated to SM80+ (Ampere and later). Specifically, the `optimize_dot_operands` pass (which hoists layout conversions before matmul) was disabled for sm75, and the software pipeline exclusively uses `cp.async`, an Ampere-only instruction. As a result, Turing performance degrades significantly compared to its tensor-core potential.
+Upstream Triton supports Turing's MMA instructions, but critical optimizations were gated to SM80+ (Ampere and later) — most importantly the software pipeline, which exclusively uses `cp.async`, an Ampere-only instruction. As a result, Turing performance degrades significantly compared to its tensor-core potential.
 
 ## Goals
 
-1. **Enable layout optimization** — `optimize_dot_operands` pass for sm75 (layout hoisting before MMA)
-2. **Software double-buffering without `cp.async`** — implement a `ld.global → st.shared → bar.sync` pipeline path to overlap memory loads with MMA on Turing
-3. **Turing-specific autotune** — configs tuned for 64 KB/CTA shared memory and native instruction shapes (fp16: `m16n8k8`, int8: `m8n8k16`)
-4. **int4 MMA support** — implement the `m8n8k32` instruction path for int4 precision (hardware-supported but not implemented in upstream Triton)
+1. **Software pipelining without `cp.async`** — a multi-stage `ld.global → st.shared → bar.sync` path to overlap memory loads with MMA on Turing (`num_stages` ≥ 2, not just double-buffering)
+2. **Turing-specific autotune** — configs tuned for 64 KB/CTA shared memory and native instruction shapes (fp16: `m16n8k8`, int8: `m8n8k16`)
+3. **int4 MMA support** — implement the `m8n8k32` instruction path for int4 precision (hardware-supported but not implemented in upstream Triton)
 
 ## Status
 
 | Feature | Status |
 |---|---|
-| `optimize_dot_operands` pass enabled for sm75 | ✅ Done |
-| Software double-buffering (`ld.global + bar.sync` pipeline) — first ever for Turing | ✅ Done |
+| Software pipelining (multi-stage `ld.global + bar.sync`) — first ever for Turing | ✅ Done |
 | Turing-specific autotune configs | ✅ Done |
 | int8 GEMM (`m8n8k16`) | ✅ Done |
 | int4 MMA (`m8n8k32`) — first usable pure-int4 matmul in Triton | ✅ Done |
@@ -24,11 +22,10 @@ Upstream Triton supports Turing's MMA instructions, but critical optimizations w
 
 ## Performance
 
-All numbers below are from a Turing card (Titan RTX / RTX 20-series, sm75). GEMM
-curves use a throttle-corrected measurement (large sizes measured cold, best of
-3 runs); without a locked clock the very largest sizes are still throttle-prone.
-Each operator is compared against the strongest existing implementation in its
-domain.
+All numbers below are from a Titan RTX (sm75). GEMM curves use a
+throttle-corrected measurement (large sizes measured cold, best of 3 runs);
+without a locked clock the very largest sizes are still throttle-prone. Each
+operator is compared against the strongest existing implementation in its domain.
 
 ### FlashAttention-2 forward — faster than a hand-written CUDA kernel
 
@@ -68,6 +65,14 @@ grouped/MoE GEMM (**+20 %**) — but not the compute-bound dense GEMM, where the
 Tensor Cores are already saturated and load latency is hidden by ILP. Kernels
 with no reduction loop to pipeline (layernorm, softmax, elementwise) are not
 applicable.
+
+Pipeline depth (`num_stages`) is configurable — not limited to double-buffering —
+and autotuned per kernel and size. Turing's small 64 KB/CTA shared memory caps the
+useful depth: for the kernels that benefit from pipelining, **`num_stages=2` is the
+sweet spot**, because a third stage usually exceeds the budget (it OOMs for
+FlashAttention). The compute-bound dense GEMM is the exception — it is fastest with
+no pipelining (`num_stages=1`), a third stage edging a few percent ahead only at the
+largest 4096³ size.
 
 A runnable INT8/INT4 example is in
 [`python/tutorials/12-turing-integer-matmul.py`](python/tutorials/12-turing-integer-matmul.py).
