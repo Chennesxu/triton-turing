@@ -38,6 +38,18 @@ CUDA/CUTLASS FlashAttention for Turing by **+7–26%**, and ahead of PyTorch SDP
 the softmax dependency chain leaves the Tensor Cores idle, and the pipeline uses
 that window to prefetch K/V.
 
+### FlashAttention-2 backward — a mixed result, and our one weakness
+
+![FlashAttention-2 backward](assets/benchmarks/fa2-backward.png)
+
+Backward is honest about a limitation. At head dim 64 our kernel still beats the
+CUDA/CUTLASS implementation by **+15–22%**. At head dim 128 it **trails by
+17–19%** — the only place we lose. The d=128 backward block needs ~68 KB of
+shared memory, narrowly over Turing's hard **64 KB/CTA** limit, so it falls back
+to a smaller block (half `BLOCK_M1`) that under-utilizes the Tensor Cores.
+Closing this gap requires a codegen-level shared-memory reduction (trimming SKEW
+padding / conversion scratch) and is future work.
+
 ### Integer GEMM — INT4 doubles INT8, and cuBLAS has no INT4 path
 
 ![Integer GEMM](assets/benchmarks/integer-gemm.png)
