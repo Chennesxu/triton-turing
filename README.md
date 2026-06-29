@@ -29,7 +29,7 @@ operator is compared against the strongest existing implementation in its domain
 
 ### FlashAttention-2 forward — faster than a hand-written CUDA kernel
 
-![FlashAttention-2 forward](assets/benchmarks/fa2-forward.png)
+![FlashAttention-2 forward](.github/assets/benchmarks/fa2-forward.png)
 
 The Triton FA2 forward kernel (tutorial `06-fused-attention.py` plus our sm75
 pipeline) is the fastest at every size measured — ahead of a from-scratch
@@ -40,7 +40,7 @@ that window to prefetch K/V.
 
 ### FlashAttention-2 backward — a mixed result, and our one weakness
 
-![FlashAttention-2 backward](assets/benchmarks/fa2-backward.png)
+![FlashAttention-2 backward](.github/assets/benchmarks/fa2-backward.png)
 
 Backward is honest about a limitation. At head dim 64 our kernel still beats the
 CUDA/CUTLASS implementation by **+15–22%**. At head dim 128 it **trails by
@@ -52,7 +52,7 @@ padding / conversion scratch) and is future work.
 
 ### Integer GEMM — INT4 doubles INT8, and cuBLAS has no INT4 path
 
-![Integer GEMM](assets/benchmarks/integer-gemm.png)
+![Integer GEMM](.github/assets/benchmarks/integer-gemm.png)
 
 INT4 (`m8n8k32`) reaches **≈ 2× the throughput of INT8** (peak **219 TOPS**),
 gaining on both fronts: 2× Tensor Core compute and half the shared-memory
@@ -62,14 +62,14 @@ the path "Not implemented"). Triton INT8 also clears cuBLAS INT8 by ~1.8×.
 
 ### FP16 GEMM — matching NVIDIA's hand-tuned cuBLAS
 
-![FP16 GEMM](assets/benchmarks/fp16-gemm.png)
+![FP16 GEMM](.github/assets/benchmarks/fp16-gemm.png)
 
 For plain FP16 GEMM the Triton kernel reaches **≈ 84–86 % of cuBLAS** — NVIDIA's
 hand-tuned vendor library — across the mid-to-large size range.
 
 ### When the software pipeline helps
 
-![Pipeline regime](assets/benchmarks/pipeline-regime.png)
+![Pipeline regime](.github/assets/benchmarks/pipeline-regime.png)
 
 The sm75 software pipeline (the first ever implemented for Turing) helps
 **latency-exposed** kernels — FlashAttention (**+48 %** fwd, **+11 %** bwd) and
