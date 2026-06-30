@@ -72,11 +72,11 @@ hand-tuned vendor library — across the mid-to-large size range.
 ![Pipeline regime](.github/assets/benchmarks/pipeline-regime.png)
 
 The sm75 software pipeline (the first ever implemented for Turing) helps
-**latency-exposed** kernels — FlashAttention (**+48 %** fwd, **+11 %** bwd) and
-grouped/MoE GEMM (**+20 %**) — but not the compute-bound dense GEMM, where the
-Tensor Cores are already saturated and load latency is hidden by ILP. Kernels
-with no reduction loop to pipeline (layernorm, softmax, elementwise) are not
-applicable.
+**latency-exposed** kernels — FlashAttention (**+48 % fwd / +11 % bwd on head_dim=128**,
+**+11 % fwd on head_dim=64**) and grouped/MoE GEMM (**+20 %**) — but not the
+compute-bound dense GEMM, where the Tensor Cores are already saturated and load
+latency is hidden by ILP. Kernels with no reduction loop to pipeline (layernorm,
+softmax, elementwise) are not applicable.
 
 Pipeline depth (`num_stages`) is configurable — not limited to double-buffering —
 and autotuned per kernel and size. Turing's small 64 KB/CTA shared memory caps the
