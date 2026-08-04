@@ -44,11 +44,18 @@ that window to prefetch K/V.
 
 Backward is honest about a limitation. At head dim 64 our kernel still beats the
 CUDA/CUTLASS implementation by **+15–22%**. At head dim 128 it **trails by
-17–19%** — the only place we lose. The d=128 backward block needs ~68 KB of
-shared memory, narrowly over Turing's hard **64 KB/CTA** limit, so it falls back
-to a smaller block (half `BLOCK_M1`) that under-utilizes the Tensor Cores.
-Closing this gap requires a codegen-level shared-memory reduction (trimming SKEW
-padding / conversion scratch) and is future work.
+17–19%** — the only place we lose. Upstream's d=128 backward blocks need ~82 KB
+of shared memory, well past Turing's hard **64 KB/CTA** limit, so `BLOCK_N1` and
+`BLOCK_M2` are halved to 64 to fit.
+
+That fallback is not a missed tuning opportunity. An exhaustive sweep of the
+block/stage/warp space — 216 configurations, of which 34 fit in 64 KB and only 18
+also satisfy the kernel's `BLOCK_N1 == BLOCK_M2` requirement — confirms the
+shipped configuration is the fastest one available. Every larger tile that fits
+forces `num_stages=1`, and giving up the pipeline costs slightly more than the
+larger tile gains: the best alternative lands within 1.7%. Closing the remaining
+gap needs a codegen-level shared-memory reduction or a different kernel
+structure, not different block sizes. That is future work.
 
 ### Integer GEMM — INT4 doubles INT8, and cuBLAS has no INT4 path
 
