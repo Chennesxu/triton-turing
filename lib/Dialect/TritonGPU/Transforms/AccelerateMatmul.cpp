@@ -62,11 +62,22 @@ static int getMMAVersionSafe(int computeCapability, DotOp op) {
   }
   for (int baseVersion : versionsSupported) {
     if (supportMMA(op, baseVersion)) {
-      // Turing (sm75) MMA only supports fp16; bf16 requires Ampere+.
+      // Turing's MMA accepts fewer element types than Ampere's, and
+      // supportMMA() does not check for it: upstream dropped sm75 MMA
+      // support, so only the Ampere-and-later constraints survive there.
+      // Without these, the dot keeps its MMA layout and reaches codegen as an
+      // illegal tt.dot instead of falling back to FMA the way it would on a
+      // target with no MMA at all.
       if (computeCapability < 80) {
         auto aElemTy = op.getA().getType().getElementType();
         auto bElemTy = op.getB().getType().getElementType();
+        // bf16 needs Ampere+.
         if (aElemTy.isBF16() || bElemTy.isBF16())
+          continue;
+        // supportMMA() admits f32 operands whenever the dot asks for TF32 --
+        // which is tl.dot's default -- but Turing has no TF32 tensor core;
+        // mma.sync...f32.tf32.tf32.f32 is sm80+.
+        if (aElemTy.isF32() || bElemTy.isF32())
           continue;
       }
       return baseVersion;

@@ -523,21 +523,23 @@ static void callMmaTuringInt8(PTXBuilder &builder, int b,
                               const BaseOffset &base,
                               mlir::triton::PTXInstr &mma, unsigned numMmaRets,
                               unsigned colsPerThread, int numCPackedElem,
-                              ValueTableV2 &ha, ValueTableV2 &hb,
-                              const SmallVector<Value> &fc) {
+                              unsigned batchOffset, ValueTableV2 &ha,
+                              ValueTableV2 &hb, const SmallVector<Value> &fc) {
   auto retArgs1 = builder.newListOperand(numMmaRets / 2, "=r");
   auto retArgs2 = builder.newListOperand(numMmaRets / 2, "=r");
   auto cArgs1 = builder.newListOperand();
   for (int i = 0; i < numMmaRets / 2; ++i) {
     cArgs1->listAppend(builder.newOperand(
-        fc[(base.m * colsPerThread + 4 * base.n) / numCPackedElem + i],
+        fc[(base.m * colsPerThread + 4 * base.n) / numCPackedElem + i +
+           batchOffset * b],
         std::to_string(i)));
     // reuse the output registers
   }
   auto cArgs2 = builder.newListOperand();
   for (int i = numMmaRets / 2; i < numMmaRets; ++i) {
     cArgs2->listAppend(builder.newOperand(
-        fc[(base.m * colsPerThread + 4 * base.n) / numCPackedElem + i],
+        fc[(base.m * colsPerThread + 4 * base.n) / numCPackedElem + i +
+           batchOffset * b],
         std::to_string(i)));
     // reuse the output registers
   }
@@ -571,13 +573,15 @@ static void callMmaTuringFp16(PTXBuilder &builder, int b,
                               const BaseOffset &base,
                               mlir::triton::PTXInstr &mma, unsigned numMmaRets,
                               unsigned colsPerThread, int numCPackedElem,
-                              ValueTableV2 &ha, ValueTableV2 &hb,
-                              const SmallVector<Value> &fc, bool isAccF16) {
+                              unsigned batchOffset, ValueTableV2 &ha,
+                              ValueTableV2 &hb, const SmallVector<Value> &fc,
+                              bool isAccF16) {
   auto retArgs = builder.newListOperand(numMmaRets, isAccF16 ? "=r" : "=f");
   auto cArgs = builder.newListOperand();
   for (int i = 0; i < numMmaRets; ++i) {
     cArgs->listAppend(builder.newOperand(
-        fc[(base.m * colsPerThread + 4 * base.n) / numCPackedElem + i],
+        fc[(base.m * colsPerThread + 4 * base.n) / numCPackedElem + i +
+           batchOffset * b],
         std::to_string(i)));
     // reuse the output registers
   }
@@ -872,13 +876,19 @@ LogicalResult convertMMA(triton::DotOp op, triton::DotOp::Adaptor adaptor,
     const unsigned numCPackedElem = isFp64MMA ? 1u : 4u / numMmaRets;
     BaseOffset base{numRegisters.m * m, numRegisters.n * n, numRegisters.k * k};
     if (isTuring) {
-      assert(b == 0 && "Turing only supports batch size 1");
+      // batchOffset is the stride between the accumulator registers of
+      // consecutive batch elements. It used to be dropped here, guarded by an
+      // assert(b == 0) that compiles away in release builds -- so a batched
+      // dot whose warps each cover more than one batch element (rank-3 dot
+      // with B > num_warps, since warpsPerTileV2 spreads warps along the batch
+      // axis) accumulated every element into batch 0's registers and returned
+      // wrong results with no diagnostic.
       if (isIntMMA)
         callMmaTuringInt8(builder, b, base, mma, numMmaRets, colsPerThread,
-                          numCPackedElem, ha, hb, fc);
+                          numCPackedElem, batchOffset, ha, hb, fc);
       else
         callMmaTuringFp16(builder, b, base, mma, numMmaRets, colsPerThread,
-                          numCPackedElem, ha, hb, fc, isAccF16);
+                          numCPackedElem, batchOffset, ha, hb, fc, isAccF16);
     } else {
       if (isFp64MMA) {
         callMmaAmpereFp64(builder, b, base, mma, numMmaRets, colsPerThread,
