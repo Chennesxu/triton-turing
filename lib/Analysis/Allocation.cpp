@@ -1,6 +1,7 @@
 #include "triton/Analysis/Allocation.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <limits>
 #include <numeric>
 
@@ -16,6 +17,7 @@
 #include "triton/Tools/LayoutUtils.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/Format.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -169,6 +171,61 @@ private:
     getValuesAndSizes();
     resolveLiveness();
     computeOffsets();
+    if (::getenv("TRITON_DUMP_SHARED_ALLOC"))
+      dumpSharedAllocLayout();
+  }
+
+  /// Print the resolved shared-memory layout: every buffer with its offset,
+  /// size and liveness interval, sorted by offset.
+  ///
+  /// The existing dumpBuffers()/dumpAllocationSize() are behind LLVM_DEBUG,
+  /// which needs an assertions-enabled build; `triton-opt --debug-only` is
+  /// unavailable in the Release builds we ship. Gating on an env var instead
+  /// makes the allocator's own view reachable without rebuilding LLVM, which
+  /// is the only way to see *why* a kernel lands on a given total -- reading
+  /// the IR and reasoning about it does not work (two structural hypotheses
+  /// about the FA2 backward allocation were wrong that way).
+  void dumpSharedAllocLayout() const {
+    SmallVector<std::pair<BufferT *, Interval<size_t>>> sorted(
+        bufferRange.begin(), bufferRange.end());
+    llvm::sort(sorted, [](const auto &a, const auto &b) {
+      return std::make_pair(a.first->offset, a.first->id) <
+             std::make_pair(b.first->offset, b.first->id);
+    });
+
+    auto kindName = [](BufferT::BufferKind k) -> const char * {
+      switch (k) {
+      case BufferT::BufferKind::Explicit:
+        return "explicit";  // ttg.local_alloc
+      case BufferT::BufferKind::Scratch:
+        return "scratch";   // e.g. ttg.convert_layout
+      case BufferT::BufferKind::Virtual:
+        return "virtual";   // triton.call
+      }
+      return "?";
+    };
+
+    llvm::errs() << "=== shared memory layout: total "
+                 << allocation->sharedMemorySize << " B ===\n";
+    llvm::errs() << llvm::format("%4s %-8s %8s %8s %8s  %-13s %s\n", "id",
+                                 "kind", "offset", "size", "end", "live",
+                                 "owner");
+    for (auto &[buf, range] : sorted) {
+      std::string live =
+          "[" + std::to_string(range.start()) + "," +
+          std::to_string(range.end()) + ")";
+      std::string owner = "?";
+      if (buf->owner) {
+        llvm::raw_string_ostream os(owner);
+        os << buf->owner->getName() << " @ " << buf->owner->getLoc();
+      }
+      llvm::errs() << llvm::format("%4d %-8s %8d %8d %8d  %-13s %s\n",
+                                   (int)buf->id, kindName(buf->kind),
+                                   (int)buf->offset, (int)buf->size,
+                                   (int)(buf->offset + buf->size), live.c_str(),
+                                   owner.c_str());
+    }
+    llvm::errs() << "=== end shared memory layout ===\n";
   }
 
   /// Initializes explicitly defined shared memory values for a given operation.
