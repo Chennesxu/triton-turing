@@ -242,6 +242,13 @@ def get_turing_autotune_config():
         # medium tiles, mid-depth pipeline
         {'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'num_stages': 3, 'num_warps': 4},
         {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'num_stages': 3, 'num_warps': 4},
+        # medium tiles, no pipeline. An exhaustive sweep of BM/BN/BK x stages x
+        # warps (benchmarks/gemm/14) found these two beat every entry above at
+        # M=N=K=1024, by 3.7% and 6.4% respectively: below ~2048 the pipeline is
+        # a net cost on medium tiles too, not just on the 128x128 ones. Larger
+        # shapes are unaffected -- the autotuner keeps picking 128x128 there.
+        {'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'num_stages': 1, 'num_warps': 4},
+        {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'num_stages': 1, 'num_warps': 4},
         # small matrices
         {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'num_stages': 2, 'num_warps': 4},
         {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'num_stages': 2, 'num_warps': 2},

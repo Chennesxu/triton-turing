@@ -382,6 +382,14 @@ def _attn_bwd(Q, K, V, sm_scale,  #
               CAUSAL: tl.constexpr):
     LN2: tl.constexpr = 0.6931471824645996  # = ln(2)
 
+    # The launch grid is sized N_CTX // BLOCK_N1, but the two halves of this
+    # kernel index off the same program id: dK/dV starts at pid * BLOCK_N1 and
+    # dQ starts at pid * BLOCK_M2. They only cover the same rows when the two
+    # block sizes agree -- a smaller BLOCK_M2 silently leaves the tail of dQ
+    # unwritten, a larger one reads out of bounds. Upstream never trips this
+    # because it hardcodes 128 for both, but it is easy to hit when autotuning.
+    tl.static_assert(BLOCK_N1 == BLOCK_M2)
+
     bhid = tl.program_id(2)
     off_chz = (bhid * N_CTX).to(tl.int64)
     adj = (stride_h * (bhid % H) + stride_z * (bhid // H)).to(tl.int64)
@@ -587,15 +595,23 @@ class _attention(torch.autograd.Function):
         NUM_WARPS, NUM_STAGES = 4, 5
         BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 32, 128, 128, 32
         if is_cuda() and torch.cuda.get_device_capability() == (7, 5):
-            # Turing: 64KB shared memory per CTA (Ampere+: >= 100KB). At
-            # HEAD_DIM=128 the upstream block sizes need ~80KB, so halve the
-            # K/V (resp. Q) row blocks to fit. A 2-stage pipeline still fits at
-            # the halved sizes and beats single-buffer by ~11% -- the softmax-
-            # gradient dependency chain exposes latency the pipeline hides
-            # (verified vs SDPA grads; same mechanism as the forward). HEAD_DIM
-            # <= 64 keeps the upstream blocks with the same 2-stage pipeline.
+            # Turing: 64KB shared memory per CTA (Ampere+: >= 100KB). Both
+            # branches below are the fastest point of an exhaustive sweep over
+            # BLOCK_M1/N1/M2/N2 x num_stages x num_warps, filtered by the 64KB
+            # budget and by BLOCK_N1 == BLOCK_M2 (see the static_assert in
+            # _attn_bwd).
             if ctx.HEAD_DIM > 64:
+                # Upstream's blocks need ~82KB here, so halve the K/V (resp. Q)
+                # row blocks. Every larger tile that fits forces num_stages=1,
+                # and losing the pipeline costs more than the tile gains.
                 BLOCK_N1, BLOCK_M2 = 64, 64
+            else:
+                # At HEAD_DIM=64 the tiles are half the bytes, so the inner
+                # steps can double and still keep the pipeline: ~+4.6% over the
+                # upstream blocks, consistently across N=1024..8192. The wider
+                # tile needs 8 warps -- at 4 it is less than half as fast.
+                BLOCK_M1, BLOCK_N2 = 64, 64
+                NUM_WARPS = 8
             NUM_STAGES = 2
         BLK_SLICE_FACTOR = 2
         RCP_LN2 = 1.4426950408889634  # = 1.0 / ln(2)

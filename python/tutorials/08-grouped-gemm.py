@@ -49,45 +49,114 @@ def num_sms():
     return 148
 
 
+def get_turing_grouped_config():
+    # Turing (sm75). The gain over the default list is almost entirely
+    # num_stages.
+    #
+    # The default list sets no num_stages at all, so every entry runs at
+    # triton.Config's default of 3. On a 128x128x32 tile that is 49152 B of
+    # shared memory -- over the 32 KB that lets two CTAs share an SM. The
+    # pipeline buys back less than the occupancy it costs, and one or two
+    # stages fit in 32768 B and win.
+    #
+    # NUM_SM matters too, but the default list mostly gets it right by
+    # accident. It is not the SM count: it is how many CTAs the persistent
+    # loop launches, and one per SM is far too few (a 4-warp CTA occupies an
+    # eighth of a Turing SM's 32 warps, so a lone resident CTA cannot cover
+    # its own memory latency). At N=1024 the same tile runs 48.1 TFLOPS at 72
+    # CTAs and 69.5 at 144. But the default list also carries the literal 128,
+    # which the autotuner duly picks, and 128 -> 144 is only worth another
+    # 0.5%. Scaling off num_sms() is still the right thing to write down.
+    #
+    # Measured on a TITAN RTX (72 SMs), group of four square fp16 matmuls,
+    # kernel launch only, against the upstream list autotuned the same way:
+    # +5% at N=512, +5-6% at 1024, +9-10% at 2048, reproducible across runs
+    # and across which shape the autotuner happened to tune on. Full sweep in
+    # benchmarks/grouped-gemm/01.
+    #
+    # Two constraints shape this list, and neither is obvious.
+    #
+    # The inner loop loads with no mask ("assume full tile for now"), so a
+    # block size that does not divide the problem dimension reads out of
+    # bounds. The benchmark below starts at N=128, which is exactly the
+    # largest block the upstream list uses -- so upstream sits on the boundary
+    # and never overruns, and anything wider is an illegal access there.
+    # 128x256 was the fastest tile measured at N>=1024 and had to be dropped
+    # for this reason.
+    #
+    # The autotune key is the group size alone (see the note on the
+    # decorator), so one config is chosen on the first call and serves every
+    # later shape. That makes near-ties at the tuning shape dangerous: the
+    # autotuner picks by its own noisy timing, and if the winner happens to be
+    # a config that collapses at other sizes, every later call pays. Two
+    # entries were dropped on that ground -- 64x128x32 (won nowhere, within a
+    # few percent at N=512) and 128x64x64 s1 (fastest at N=512, but a coin
+    # flip against 128x128 at N=128, and 15% slower at N>=1024 when it won
+    # that flip). What is left differs by far more than the noise, so the
+    # choice is reproducible.
+    sizes = [
+        {'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'num_stages': 1, 'num_warps': 4},
+        {'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'num_stages': 2, 'num_warps': 4},
+    ]
+    # One CTA per SM stays in the list for problems with too few tiles to fill
+    # two waves; the sweep never picked it above N=512.
+    return [
+        triton.Config(
+            {k: v for k, v in s.items() if k.startswith('BLOCK')} | {'NUM_SM': n},
+            num_stages=s['num_stages'], num_warps=s['num_warps'])
+        for s in sizes
+        for n in (num_sms(), 2 * num_sms())
+    ]
+
+
+def get_grouped_autotune_config():
+    if is_cuda() and torch.cuda.get_device_capability() == (7, 5):
+        return get_turing_grouped_config()
+    return [
+        triton.Config({
+            'BLOCK_SIZE_M': 128,
+            'BLOCK_SIZE_N': 128,
+            'BLOCK_SIZE_K': 32,
+            'NUM_SM': 84,
+        }),
+        triton.Config({
+            'BLOCK_SIZE_M': 128,
+            'BLOCK_SIZE_N': 128,
+            'BLOCK_SIZE_K': 32,
+            'NUM_SM': 128,
+        }),
+        triton.Config({
+            'BLOCK_SIZE_M': 64,
+            'BLOCK_SIZE_N': 64,
+            'BLOCK_SIZE_K': 32,
+            'NUM_SM': 84,
+        }),
+        triton.Config({
+            'BLOCK_SIZE_M': 64,
+            'BLOCK_SIZE_N': 64,
+            'BLOCK_SIZE_K': 32,
+            'NUM_SM': 128,
+        }),
+        triton.Config({
+            'BLOCK_SIZE_M': 128,
+            'BLOCK_SIZE_N': 128,
+            'BLOCK_SIZE_K': 64,
+            'NUM_SM': num_sms(),
+        }),
+        triton.Config({
+            'BLOCK_SIZE_M': 64,
+            'BLOCK_SIZE_N': 128,
+            'BLOCK_SIZE_K': 64,
+            'NUM_SM': num_sms(),
+        }),
+    ]
+
+
 @triton.autotune(
-    configs=[
-        triton.Config({
-            'BLOCK_SIZE_M': 128,
-            'BLOCK_SIZE_N': 128,
-            'BLOCK_SIZE_K': 32,
-            'NUM_SM': 84,
-        }),
-        triton.Config({
-            'BLOCK_SIZE_M': 128,
-            'BLOCK_SIZE_N': 128,
-            'BLOCK_SIZE_K': 32,
-            'NUM_SM': 128,
-        }),
-        triton.Config({
-            'BLOCK_SIZE_M': 64,
-            'BLOCK_SIZE_N': 64,
-            'BLOCK_SIZE_K': 32,
-            'NUM_SM': 84,
-        }),
-        triton.Config({
-            'BLOCK_SIZE_M': 64,
-            'BLOCK_SIZE_N': 64,
-            'BLOCK_SIZE_K': 32,
-            'NUM_SM': 128,
-        }),
-        triton.Config({
-            'BLOCK_SIZE_M': 128,
-            'BLOCK_SIZE_N': 128,
-            'BLOCK_SIZE_K': 64,
-            'NUM_SM': num_sms(),
-        }),
-        triton.Config({
-            'BLOCK_SIZE_M': 64,
-            'BLOCK_SIZE_N': 128,
-            'BLOCK_SIZE_K': 64,
-            'NUM_SM': num_sms(),
-        }),
-    ],
+    configs=get_grouped_autotune_config(),
+    # NOTE: the key is the group size only, so the autotuner tunes once and
+    # reuses that choice for every matrix shape it later sees. Whichever shape
+    # happens to arrive first decides. That is upstream behaviour, left as is.
     key=['group_size'],
 )
 @triton.jit
