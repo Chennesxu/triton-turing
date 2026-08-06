@@ -22,13 +22,10 @@ Upstream Triton supports Turing's MMA instructions, but critical optimizations w
 
 ## Performance
 
-All numbers below are from a Titan RTX (sm75). GEMM curves use a
-throttle-corrected measurement (large sizes measured cold, best of 3 runs);
-without a locked clock the very largest sizes are still throttle-prone. The two
-FlashAttention figures come from a single process that measures forward,
-backward and all four implementations back to back, so every comparison within
-them shares one thermal state. Each operator is compared against the strongest
-existing implementation in its domain.
+All numbers below are from a Titan RTX (sm75), each operator against the
+strongest existing implementation in its domain. The clock is not locked, so
+every comparison is made within a single process; the very largest GEMM sizes
+are still throttle-prone.
 
 ### FlashAttention-2 forward — faster than a hand-written CUDA kernel
 
@@ -42,38 +39,24 @@ CUDA/CUTLASS FlashAttention for Turing by **+21–26%** at head dim 64 and
 dependency chain leaves the Tensor Cores idle, and the pipeline uses that window
 to prefetch K/V.
 
-An exhaustive sweep of the forward block/stage/warp space found no headroom
-left: the autotune list already contains the winner at every size, 256-row
-blocks at best tie, and `num_stages=1` is 9–20% slower because the forward is
-latency-exposed and genuinely wants the pipeline.
-
 ### FlashAttention-2 backward — a mixed result, and our one weakness
 
 ![FlashAttention-2 backward](.github/assets/benchmarks/fa2-backward.png)
 
 Backward is honest about a limitation. At head dim 64 our kernel beats the
-CUDA/CUTLASS implementation by **+35–41%** — that margin comes from two
-compounding changes: retuning the block sizes for Turing (+6%), and a codegen
-change that lets a transposed dot operand read the shared buffer its
-untransposed sibling already filled, instead of paying a scratch round trip per
-loop iteration (−8–14% kernel time under a locked clock).
+CUDA/CUTLASS implementation by **+35–41%**, from Turing-specific block sizes
+plus a codegen change that lets a transposed dot operand read the shared buffer
+its untransposed sibling already filled, instead of paying a scratch round trip
+every loop iteration.
 
-At head dim 128 it **trails by 13–16%** — the only place we lose. That
-configuration is unchanged: the codegen change above is gated off there, because
-the backward kernel compiles at the 255-register ceiling and holding the buffer
-live longer tips it into spilling (local memory traffic goes from 15 MB to 688
-MB). Upstream's d=128 backward blocks need ~82 KB of shared memory, well past
-Turing's hard **64 KB/CTA** limit, so `BLOCK_N1` and `BLOCK_M2` are halved to 64
-to fit.
-
-That fallback is not a missed tuning opportunity. An exhaustive sweep of the
-block/stage/warp space — 216 configurations, of which 34 fit in 64 KB and only 18
-also satisfy the kernel's `BLOCK_N1 == BLOCK_M2` requirement — confirms the
-shipped configuration is the fastest one available. Every larger tile that fits
-forces `num_stages=1`, and giving up the pipeline costs slightly more than the
-larger tile gains: the best alternative lands within 1.7%. Closing the remaining
-gap needs a codegen-level shared-memory reduction or a different kernel
-structure, not different block sizes. That is future work.
+At head dim 128 it **trails by 13–16%** — the only place we lose. Upstream's
+d=128 backward blocks need ~82 KB of shared memory, well past Turing's hard
+**64 KB/CTA** limit, so `BLOCK_N1` and `BLOCK_M2` are halved to 64 to fit. An
+exhaustive sweep of the 216-configuration block/stage/warp space confirms that
+fallback is the fastest option available, not a tuning oversight: every larger
+tile that fits forces `num_stages=1`, and losing the pipeline costs more than
+the tile gains. Closing the gap needs a different kernel structure, and that is
+future work.
 
 ### Integer GEMM — INT4 doubles INT8, and cuBLAS has no INT4 path
 
@@ -90,14 +73,12 @@ the path "Not implemented"). Triton INT8 also clears cuBLAS INT8 by ~1.8×.
 ![FP16 GEMM](.github/assets/benchmarks/fp16-gemm.png)
 
 For plain FP16 GEMM the Triton kernel reaches **≈ 84–86 % of cuBLAS** — NVIDIA's
-hand-tuned vendor library — across the mid-to-large size range. A 108-config
-sweep confirms the autotune list is already at that ceiling above 2048; the only
-gap it found was near 1 K, where two single-stage configs are worth **+3–4 %**.
+hand-tuned vendor library — across the mid-to-large size range.
 
-Grouped (MoE) GEMM gained **+5–10 %** from the same exercise, almost all of it
-from dropping `num_stages` from 3 to 2: at 3 stages a 128×128×32 tile needs
-49152 B of shared memory, over the 32 KB that lets two CTAs share a Turing SM,
-and the pipeline buys back less than the occupancy it costs.
+Grouped (MoE) GEMM runs **+5–10 %** faster than the upstream configuration,
+almost all of it from using two pipeline stages instead of three: the third
+stage pushes a 128×128×32 tile past the 32 KB that lets two CTAs share a Turing
+SM, and buys back less than the occupancy it costs.
 
 ### When the software pipeline helps
 
