@@ -105,8 +105,8 @@ A runnable INT8/INT4 example is in
 ## Installation
 
 ```shell
-git clone <this repo>
-cd triton
+git clone https://github.com/Chennesxu/triton-turing.git
+cd triton-turing
 pip install -r python/requirements.txt
 pip install -e .
 ```
