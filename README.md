@@ -112,3 +112,8 @@ pip install -e .
 ```
 
 Requires a Turing GPU (sm75) and CUDA 11+. For full build instructions see the [upstream docs](https://triton-lang.org).
+
+**Windows:** this repo builds on Linux. For Windows, see
+[hicaonmb/triton-windows-turing](https://github.com/hicaonmb/triton-windows-turing),
+which combines the INT4/INT8 support from here with
+[triton-windows](https://github.com/triton-lang/triton-windows).
