@@ -1,3 +1,5 @@
+
+
 # Triton-Turing
 
 **Triton-Turing** is a community-maintained fork of [Triton](https://github.com/triton-lang/triton) focused on restoring high-performance Tensor Core support for NVIDIA Turing GPUs (SM75: RTX 2080 Ti, Titan RTX).
@@ -112,6 +114,8 @@ pip install -e .
 ```
 
 Requires a Turing GPU (sm75) and CUDA 11+. For full build instructions see the [upstream docs](https://triton-lang.org).
+
+The repository also contains a separate `triton_kernels` package; if you need it, install it with `pip install -e python/triton_kernels`.
 
 **Windows:** this repo builds on Linux. For Windows, see
 [hicaonmb/triton-windows-turing](https://github.com/hicaonmb/triton-windows-turing),
