@@ -1,0 +1,46 @@
+include_directories(${PROJECT_SOURCE_DIR}/examples/plugins/DialectPlugins/DialectPlugin/include)
+include_directories(${PROJECT_BINARY_DIR}/examples/plugins/DialectPlugins/DialectPlugin/include)
+include_directories(${PROJECT_SOURCE_DIR}/third_party/nvidia/include)
+
+if(WIN32)
+  set(MLIR_DIALECT_PLUGIN_LINK_LIBS
+      MLIRPass
+      LLVMSupport
+      MLIRSupport
+      MLIRArithDialect
+      TritonNVIDIAGPUToLLVM)
+else()
+  set(MLIR_DIALECT_PLUGIN_LINK_LIBS triton)
+endif()
+
+add_mlir_dialect_library(MLIRDialectPlugin
+        DialectPluginTypes.cpp
+        DialectPluginDialect.cpp
+        DialectPluginOps.cpp
+        DialectPluginPasses.cpp
+        SHARED
+
+        ADDITIONAL_HEADER_DIRS
+        ${PROJECT_SOURCE_DIR}/plugins/include/
+
+        DEPENDS
+        TritonIR
+        TritonTableGen
+        TritonCanonicalizeIncGen
+        TritonNVIDIAGPUConversionPassIncGen
+        MLIRDialectPluginPassesIncGen
+
+        LINK_LIBS PUBLIC
+        ${MLIR_DIALECT_PLUGIN_LINK_LIBS}
+
+        "$<$<PLATFORM_ID:Darwin>:-undefined dynamic_lookup>"
+        )
+
+if(NOT MSVC)
+    target_compile_options(MLIRDialectPlugin PRIVATE -fvisibility=hidden)
+endif()
+if(DEFINED CMAKE_LIBRARY_OUTPUT_DIRECTORY)
+    set_target_properties(MLIRDialectPlugin PROPERTIES
+                          LIBRARY_OUTPUT_DIRECTORY
+                          "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/../plugins")
+endif(DEFINED CMAKE_LIBRARY_OUTPUT_DIRECTORY)

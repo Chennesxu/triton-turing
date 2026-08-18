@@ -1,0 +1,9 @@
+{
+  "ptxas-blackwell": "13.1.80",
+  "ptxas": "12.8.93",
+  "cuobjdump": "13.1.80",
+  "nvdisasm": "13.1.80",
+  "cudacrt": "13.1.80",
+  "cudart": "13.1.80",
+  "cupti": "12.8.90"
+}

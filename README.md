@@ -1,0 +1,126 @@
+# Triton-Turing (Windows)
+
+**Triton-Turing for Windows** is a Turing (SM75) build of Triton: it takes
+[triton-windows](https://github.com/triton-lang/triton-windows) as its base and
+adds this fork's Tensor Core work for NVIDIA Turing GPUs (RTX 2080 Ti, Titan RTX).
+
+Upstream Triton supports Turing's MMA instructions, but critical optimizations were gated to SM80+ (Ampere and later) — most importantly the software pipeline, which exclusively uses `cp.async`, an Ampere-only instruction. As a result, Turing performance degrades significantly compared to its tensor-core potential. Upstream also does not build on Windows at all; triton-windows solves that half.
+
+> **Not tested on Windows by us.** We develop on Linux and have no Turing card
+> in a Windows machine, so this branch is unverified on the platform it targets.
+> The performance numbers below were measured on Linux. Please report what breaks.
+
+## Goals
+
+1. **Software pipelining without `cp.async`** — a multi-stage `ld.global → st.shared → bar.sync` path to overlap memory loads with MMA on Turing (`num_stages` ≥ 2, not just double-buffering)
+2. **Turing-specific autotune** — configs tuned for 64 KB/CTA shared memory and native instruction shapes (fp16: `m16n8k8`, int8: `m8n8k16`)
+3. **int4 MMA support** — implement the `m8n8k32` instruction path for int4 precision (hardware-supported but not implemented in upstream Triton)
+
+## Status
+
+| Feature | Status |
+|---|---|
+| Software pipelining (multi-stage `ld.global + bar.sync`) — first ever for Turing | ✅ Done |
+| Turing-specific autotune configs | ✅ Done |
+| int8 GEMM (`m8n8k16`) | ✅ Done |
+| int4 MMA (`m8n8k32`) — first usable pure-int4 matmul in Triton | ✅ Done |
+| FlashAttention-2 forward + backward (pipelined) | ✅ Done |
+
+## Performance
+
+All numbers below are from a Titan RTX (sm75), each operator against the
+strongest existing implementation in its domain. The clock is not locked, so
+every comparison is made within a single process; the very largest GEMM sizes
+are still throttle-prone.
+
+### FlashAttention-2 forward — faster than a hand-written CUDA kernel
+
+![FlashAttention-2 forward](.github/assets/benchmarks/fa2-forward.png)
+
+The Triton FA2 forward kernel (tutorial `06-fused-attention.py` plus our sm75
+pipeline) is the fastest at every size measured — ahead of a from-scratch
+CUDA/CUTLASS FlashAttention for Turing by **+21–26%** at head dim 64 and
+**+4–8%** at head dim 128, and ahead of PyTorch SDPA (xformers backend) by
+**1.7–2.2×**. Attention benefits from the pipeline because the softmax
+dependency chain leaves the Tensor Cores idle, and the pipeline uses that window
+to prefetch K/V.
+
+### FlashAttention-2 backward — a mixed result, and our one weakness
+
+![FlashAttention-2 backward](.github/assets/benchmarks/fa2-backward.png)
+
+Backward is honest about a limitation. At head dim 64 our kernel beats the
+CUDA/CUTLASS implementation by **+35–41%**, from Turing-specific block sizes
+plus a codegen change that lets a transposed dot operand read the shared buffer
+its untransposed sibling already filled, instead of paying a scratch round trip
+every loop iteration.
+
+At head dim 128 it **trails by 13–16%** — the only place we lose. Upstream's
+d=128 backward blocks need ~82 KB of shared memory, well past Turing's hard
+**64 KB/CTA** limit, so `BLOCK_N1` and `BLOCK_M2` are halved to 64 to fit. An
+exhaustive sweep of the 216-configuration block/stage/warp space confirms that
+fallback is the fastest option available, not a tuning oversight: every larger
+tile that fits forces `num_stages=1`, and losing the pipeline costs more than
+the tile gains. Closing the gap needs a different kernel structure, and that is
+future work.
+
+### Integer GEMM — INT4 doubles INT8, and cuBLAS has no INT4 path
+
+![Integer GEMM](.github/assets/benchmarks/integer-gemm.png)
+
+INT4 (`m8n8k32`) reaches **≈ 2× the throughput of INT8** (peak **219 TOPS**),
+gaining on both fronts: 2× Tensor Core compute and half the shared-memory
+traffic (operands stay packed as `int32`). cuBLAS exposes **no INT4 GEMM at all**
+on Turing — this is the first usable pure-int4 matmul in Triton (upstream marks
+the path "Not implemented"). Triton INT8 also clears cuBLAS INT8 by ~1.8×.
+
+### FP16 GEMM — matching NVIDIA's hand-tuned cuBLAS
+
+![FP16 GEMM](.github/assets/benchmarks/fp16-gemm.png)
+
+For plain FP16 GEMM the Triton kernel reaches **≈ 84–86 % of cuBLAS** — NVIDIA's
+hand-tuned vendor library — across the mid-to-large size range.
+
+Grouped (MoE) GEMM runs **+5–10 %** faster than the upstream configuration,
+almost all of it from using two pipeline stages instead of three: the third
+stage pushes a 128×128×32 tile past the 32 KB that lets two CTAs share a Turing
+SM, and buys back less than the occupancy it costs.
+
+### When the software pipeline helps
+
+![Pipeline regime](.github/assets/benchmarks/pipeline-regime.png)
+
+The sm75 software pipeline (the first ever implemented for Turing) helps
+**latency-exposed** kernels — FlashAttention (**+48 % fwd / +11 % bwd on head_dim=128**,
+**+11 % fwd on head_dim=64**) and grouped/MoE GEMM (**+20 %**) — but not the
+compute-bound dense GEMM, where the Tensor Cores are already saturated and load
+latency is hidden by ILP. Kernels with no reduction loop to pipeline (layernorm,
+softmax, elementwise) are not applicable.
+
+Pipeline depth (`num_stages`) is configurable — not limited to double-buffering —
+and autotuned per kernel and size. Turing's small 64 KB/CTA shared memory caps the
+useful depth: for the kernels that benefit from pipelining, **`num_stages=2` is the
+sweet spot**, because a third stage usually exceeds the budget (it OOMs for
+FlashAttention). The compute-bound dense GEMM is the exception — it is fastest with
+no pipelining (`num_stages=1`), a third stage edging a few percent ahead only at the
+largest 4096³ size.
+
+A runnable INT8/INT4 example is in
+[`python/tutorials/12-turing-integer-matmul.py`](python/tutorials/12-turing-integer-matmul.py).
+
+## Installation
+
+Build from source with MSVC. From an **x64 Native Tools Command Prompt for VS 2022**:
+
+```shell
+git clone -b windows https://github.com/Chennesxu/triton-turing.git
+cd triton-turing
+python setup.py bdist_wheel -v
+pip install dist\*.whl
+```
+
+Requires a Turing GPU (sm75), CUDA 11+, and MSVC v143. LLVM is downloaded
+automatically. For build details and troubleshooting see
+[triton-windows' BUILD.md](https://github.com/triton-lang/triton-windows/blob/readme/BUILD.md).
+
+The Linux version of this fork is on the [`main` branch](https://github.com/Chennesxu/triton-turing).
