@@ -117,7 +117,7 @@ Requires a Turing GPU (sm75) and CUDA 11+. For full build instructions see the [
 
 The repository also contains a separate `triton_kernels` package; if you need it, install it with `pip install -e python/triton_kernels`.
 
-**Windows:** this repo builds on Linux. For Windows, see
-[hicaonmb/triton-windows-turing](https://github.com/hicaonmb/triton-windows-turing),
-which combines the INT4/INT8 support from here with
-[triton-windows](https://github.com/triton-lang/triton-windows).
+**Windows:** the [`windows` branch](https://github.com/Chennesxu/triton-turing/tree/windows)
+carries the same sm75 work on top of
+[triton-windows](https://github.com/triton-lang/triton-windows) and builds with
+MSVC. Untested by us — we have no Turing card in a Windows machine.
