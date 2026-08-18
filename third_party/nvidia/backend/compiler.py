@@ -279,7 +279,7 @@ class CUDABackend(BaseBackend):
         passes.ttgpuir.add_optimize_thread_locality(pm)
         passes.ttgpuir.add_accelerate_matmul(pm)
         passes.ttgpuir.add_remove_layout_conversions(pm)
-        passes.ttgpuir.add_optimize_dot_operands(pm, capability >= 80)
+        passes.ttgpuir.add_optimize_dot_operands(pm, capability >= 75)
         nvidia.passes.ttnvgpuir.add_optimize_descriptor_encoding(pm)
         passes.ttir.add_loop_aware_cse(pm)
         if capability // 10 in [8, 9]:
@@ -325,7 +325,7 @@ class CUDABackend(BaseBackend):
         passes.common.add_canonicalizer(pm)
         passes.ttir.add_loop_aware_cse(pm)
         passes.ttgpuir.add_prefetch(pm)
-        passes.ttgpuir.add_optimize_dot_operands(pm, capability >= 80)
+        passes.ttgpuir.add_optimize_dot_operands(pm, capability >= 75)
         passes.ttgpuir.add_coalesce_async_copy(pm)
         nvidia.passes.ttnvgpuir.add_optimize_tmem_layouts(pm)
         if capability // 10 >= 9:
