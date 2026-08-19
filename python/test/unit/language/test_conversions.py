@@ -432,3 +432,51 @@ def test_typeconvert_downcast_clamping(src_dtype, dst_dtype, mode, device, round
         assert(torch.all(torch.isnan(dst)))
     else:
         torch.testing.assert_close(dst, torch.full_like(dst, expected_result))
+
+
+@triton.jit
+def f32_to_bf16_rtz(src, dst, BLOCK_SIZE : tl.constexpr):
+    idxs = tl.arange(0, BLOCK_SIZE)
+    x = tl.load(src + idxs)
+    y = x.to(tl.bfloat16, fp_downcast_rounding='rtz')
+    tl.store(dst + idxs, y.to(tl.uint16, bitcast=True))
+
+
+# test_typeconvert_downcast never sees these: exhaustive_populate zeroes every
+# input whose magnitude exceeds max_repr (0x7f7f0000 for bf16), which drops all
+# infinities and all NaNs. Turing has no cvt.rz.bf16.f32, so it takes a software
+# path where truncating the low 16 bits would silently turn a NaN whose payload
+# lives in those bits into an infinity. Check the class, not the bits: PTX does
+# not pin down which NaN payload the hardware instruction produces.
+def test_typeconvert_downcast_bf16_rtz_special(device):
+    if not is_cuda():
+        pytest.skip("f32->bf16 rtz special-value test is NVIDIA-specific")
+
+    src_bits = [
+        0x7f800001, 0xff800001,  # NaN, payload only in the discarded low bits
+        0x7fc00000, 0xffc00000,  # quiet NaN
+        0x7fbfffff, 0xffbfffff,  # signaling NaN, largest payload
+        0x7f800000, 0xff800000,  # infinity
+        0x00000000, 0x80000000,  # zero
+        0x00000001, 0x80000001,  # smallest subnormal
+        0x3fc00000, 0xbfc00000,  # 1.5
+        0x7f7fffff, 0xff7fffff,  # FLT_MAX
+    ]
+    BLOCK_SIZE = len(src_bits)
+    src = torch.tensor(src_bits, dtype=torch.int64, device=device).to(torch.int32)
+    dst = torch.empty(BLOCK_SIZE, dtype=torch.int16, device=device)
+    f32_to_bf16_rtz[(1,)](triton.reinterpret(src, tl.float32), dst, BLOCK_SIZE)
+
+    got = dst.cpu().numpy().astype(np.uint16)
+    for bits, y in zip(src_bits, got):
+        mag = bits & 0x7fffffff
+        exponent, mantissa = (y >> 7) & 0xff, y & 0x7f
+        if mag > 0x7f800000:
+            assert exponent == 0xff and mantissa != 0, \
+                f"0x{bits:08x} (NaN) converted to 0x{y:04x}, which is not a NaN"
+        elif mag == 0x7f800000:
+            assert y == bits >> 16, \
+                f"0x{bits:08x} (inf) converted to 0x{y:04x}"
+        else:
+            assert y == bits >> 16, \
+                f"0x{bits:08x} truncated to 0x{y:04x}, expected 0x{bits >> 16:04x}"
