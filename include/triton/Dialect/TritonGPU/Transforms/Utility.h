@@ -296,6 +296,16 @@ LogicalResult verifyBarrierType(Operation *op,
 // Get a boolean if the Value is an arith::ConstantOp
 std::optional<bool> getBoolFromConstant(Value cst);
 
+// If ReduceDataDuplication would stage `cvtOp` through shared memory, return
+// the buffer type it would allocate; otherwise return nullopt.
+//
+// The pass itself calls this, so a caller that needs to reason about that
+// allocation before the pass has run -- the sm75 pipeline-depth clamp in
+// AssignLatencies, which runs well before it -- gets the same answer instead
+// of a second copy of the predicate that can drift out of step.
+std::optional<mlir::triton::gpu::MemDescType>
+getReduceDataDuplicationBufferType(mlir::triton::gpu::ConvertLayoutOp cvtOp);
+
 } // namespace mlir::triton
 
 #endif // TRITON_DIALECT_TRITONGPU_TRANSFORMS_UTILITY_H_

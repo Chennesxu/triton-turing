@@ -17,6 +17,7 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/TritonGPUConversion.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 
 namespace mlir {
 namespace triton {
@@ -134,29 +135,17 @@ public:
     mod.walk(
         [&](triton::gpu::ConvertLayoutOp cvtOp) { cvtOps.push_back(cvtOp); });
     for (triton::gpu::ConvertLayoutOp cvtOp : cvtOps) {
+      // The predicate and the buffer type live in Utility.cpp so that the
+      // sm75 pipeline-depth clamp, which has to reason about this allocation
+      // long before this pass runs, asks the same question we answer here.
+      std::optional<triton::gpu::MemDescType> tmpType =
+          triton::getReduceDataDuplicationBufferType(cvtOp);
+      if (!tmpType)
+        continue;
       OpBuilder builder(cvtOp);
-      auto srcType = cast<RankedTensorType>(cvtOp.getSrc().getType());
       auto dstType = cast<RankedTensorType>(cvtOp.getType());
-      auto srcEncoding = srcType.getEncoding();
-      if (isa<triton::gpu::SharedEncodingTrait>(srcEncoding))
-        continue;
-      auto dstDotOp =
-          dyn_cast<triton::gpu::DotOperandEncodingAttr>(dstType.getEncoding());
-      if (!dstDotOp)
-        continue;
-      if (!cvtNeedsSharedMemory(srcType, dstType))
-        continue;
-      auto order = getOrderForMemory(srcType);
-      auto sharedMemorySpace =
-          triton::gpu::SharedMemorySpaceAttr::get(srcType.getContext());
-      auto tmpType = triton::gpu::MemDescType::get(
-          dstType.getShape(), dstType.getElementType(),
-          triton::gpu::SwizzledSharedEncodingAttr::get(
-              mod.getContext(), dstDotOp, srcType.getShape(), order,
-              triton::gpu::getCGALayout(srcEncoding), srcType.getElementType()),
-          sharedMemorySpace);
       auto tmp = triton::gpu::LocalAllocOp::create(builder, cvtOp.getLoc(),
-                                                   tmpType, cvtOp.getSrc());
+                                                   *tmpType, cvtOp.getSrc());
       auto newConvert = triton::gpu::LocalLoadOp::create(
           builder, cvtOp.getLoc(), dstType, tmp);
       Value src = cvtOp.getSrc();
