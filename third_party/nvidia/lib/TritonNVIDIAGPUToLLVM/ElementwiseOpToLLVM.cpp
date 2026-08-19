@@ -714,7 +714,33 @@ struct FpToFpOpConversion
 
   static Value convertFp32ToBf16(Location loc,
                                  ConversionPatternRewriter &rewriter,
-                                 const Value &v, const RoundingMode rounding) {
+                                 const Value &v, const RoundingMode rounding,
+                                 int computeCapability) {
+    if (rounding == RoundingMode::RTZ && computeCapability < 80) {
+      // cvt.rz.bf16.f32 is sm80+, and llvm.nvvm.f2bf16.rz lowers straight to
+      // it, so on Turing ptxas rejects the kernel outright. Truncating the low
+      // 16 bits is exactly round-toward-zero for this pair: bf16 is the f32
+      // sign and exponent plus the top 7 mantissa bits, and the format is
+      // sign-magnitude, so discarding low mantissa bits always moves the
+      // magnitude toward zero. Zeros, infinities, normals and subnormals all
+      // come out right, and the shift is integer arithmetic so FTZ does not
+      // touch it.
+      //
+      // NaN is the one case truncation gets wrong: a NaN whose payload lives
+      // entirely in the discarded low bits (0x7f800001, say) truncates to
+      // 0x7f80, which is infinity. Detect it and emit a quiet NaN instead, the
+      // same fallback CUDA uses on pre-sm80 targets (__internal_float2bfloat16
+      // in cuda_bf16.hpp returns 0x7fff when the magnitude exceeds 0x7f800000).
+      // PTX does not pin down which NaN payload cvt.rz produces, so matching
+      // the class rather than the bits is the strongest guarantee available.
+      auto b = TritonLLVMOpBuilder(loc, rewriter);
+      Value bits = b.bitcast(v, i32_ty);
+      Value hi = b.trunc(i16_ty, b.lshr(bits, b.i32_val(16)));
+      Value absBits = b.and_(bits, b.i32_val(0x7fffffff));
+      Value isNaN = b.icmp_ugt(absBits, b.i32_val(0x7f800000));
+      Value quietNaN = b.int_val(16, 0x7fff);
+      return b.bitcast(b.select(isNaN, quietNaN, hi), bf16_ty);
+    }
     StringRef name;
     switch (rounding) {
     case RoundingMode::RTNE:
@@ -868,8 +894,9 @@ struct FpToFpOpConversion
              "rounding mode must be specified for fp32->bf16 conversion");
       SmallVector<Value> outVals;
       for (Value v : operands[0]) {
-        outVals.push_back(
-            convertFp32ToBf16(loc, rewriter, v, roundingMode.value()));
+        outVals.push_back(convertFp32ToBf16(loc, rewriter, v,
+                                            roundingMode.value(),
+                                            computeCapability));
       }
       return outVals;
     }
