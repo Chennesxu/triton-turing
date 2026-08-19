@@ -59,6 +59,14 @@ class TritonLLVMDiagnosticCapture {
 
   static void handleDiagnostic(const llvm::DiagnosticInfo *diagnostic,
                                void *context) {
+    // Remarks are optimization notes, not problems, and the NVPTX backend
+    // emits them for every kernel it compiles. Every severity lands in the
+    // same string, and the caller prints that string unconditionally whenever
+    // compilation succeeds, so leaving remarks in buries the warnings that do
+    // matter under pages of noise on an ordinary run. Errors are unaffected --
+    // those are detected from HasErrors on the context, not from this string.
+    if (diagnostic->getSeverity() == llvm::DS_Remark)
+      return;
     auto *capture = static_cast<TritonLLVMDiagnosticCapture *>(context);
     llvm::raw_string_ostream stream(capture->message);
     stream << llvm::LLVMContext::getDiagnosticMessagePrefix(
