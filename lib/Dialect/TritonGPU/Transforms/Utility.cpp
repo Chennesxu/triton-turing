@@ -1728,4 +1728,27 @@ std::optional<bool> getBoolFromConstant(Value cst) {
   return std::nullopt;
 }
 
+std::optional<ttg::MemDescType>
+getReduceDataDuplicationBufferType(ttg::ConvertLayoutOp cvtOp) {
+  auto srcType = cast<RankedTensorType>(cvtOp.getSrc().getType());
+  auto dstType = cast<RankedTensorType>(cvtOp.getType());
+  auto srcEncoding = srcType.getEncoding();
+  if (isa<ttg::SharedEncodingTrait>(srcEncoding))
+    return std::nullopt;
+  auto dstDotOp = dyn_cast<ttg::DotOperandEncodingAttr>(dstType.getEncoding());
+  if (!dstDotOp)
+    return std::nullopt;
+  if (!cvtNeedsSharedMemory(srcType, dstType))
+    return std::nullopt;
+  auto order = ttg::getOrderForMemory(srcType);
+  auto sharedMemorySpace =
+      ttg::SharedMemorySpaceAttr::get(srcType.getContext());
+  return ttg::MemDescType::get(
+      dstType.getShape(), dstType.getElementType(),
+      ttg::SwizzledSharedEncodingAttr::get(
+          cvtOp.getContext(), dstDotOp, srcType.getShape(), order,
+          ttg::getCGALayout(srcEncoding), srcType.getElementType()),
+      sharedMemorySpace);
+}
+
 } // namespace mlir::triton

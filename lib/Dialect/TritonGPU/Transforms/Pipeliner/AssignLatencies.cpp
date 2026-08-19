@@ -112,13 +112,20 @@ private:
       unsigned loadLatency) {
     constexpr int64_t kSm75SharedMemoryBudget = 64 * 1024;
 
+    // Count scalar loads too. Skipping anything that is not a RankedTensorType
+    // used to look safe, but the pipeliner buffers those loads all the same:
+    // SageAttention's _attn_fwd does `k_scale = tl.load(K_scale_ptr)` off a
+    // scalar pointer, and that one f32 still gets a slot per stage. Leaving it
+    // out made the estimate 8 B per two slots too low, which was exactly enough
+    // to push the kernel past 64 KB after this function had declared it fit.
     int64_t bytesPerSlot = 0;
     for (auto &[loadOp, info] : loadOpToIndLevel) {
-      auto tensorTy =
-          dyn_cast<RankedTensorType>(loadOp->getResultTypes().front());
-      if (!tensorTy)
-        continue;
-      bytesPerSlot += tensorBytes(tensorTy);
+      Type resultTy = loadOp->getResultTypes().front();
+      if (auto tensorTy = dyn_cast<RankedTensorType>(resultTy)) {
+        bytesPerSlot += tensorBytes(tensorTy);
+      } else if (resultTy.isIntOrFloat()) {
+        bytesPerSlot += llvm::divideCeil(resultTy.getIntOrFloatBitWidth(), 8);
+      }
     }
     if (bytesPerSlot == 0)
       return loadLatency;
@@ -132,6 +139,11 @@ private:
     Operation *scope = forOp->getParentOfType<triton::FuncOp>();
     if (!scope)
       scope = forOp->getParentOfType<ModuleOp>();
+    // A loop always sits inside one of the two, but this pass also runs on
+    // hand-written IR fragments in tests. Without a scope there is nothing to
+    // measure, and guessing a budget would be worse than not clamping.
+    if (!scope)
+      return loadLatency;
     scope->walk([&](ttg::LocalAllocOp alloc) {
       if (alloc.getSrc())
         if (Operation *def = alloc.getSrc().getDefiningOp())
@@ -151,8 +163,59 @@ private:
       staticBytes += elems * llvm::divideCeil(elemBits, 8);
     });
 
+    // The walk above only finds local_allocs that already exist. The big one
+    // usually does not: ReduceDataDuplication stages dot operands through
+    // shared memory, and it runs long after this pass, so the buffer it will
+    // create is invisible here. For SageAttention's _attn_fwd that is q --
+    // 128x128 i8, 16 KB -- and missing it left the budget 16 KB too generous,
+    // which is what let the pipeline overflow shared memory.
+    //
+    // Ask RDD's own predicate rather than guessing from the dots. RDD keys on
+    // convert_layout, not on tt.dot, and the difference is not academic here:
+    // a Turing bf16 or f32 dot falls back to FMA with no dot-operand
+    // conversion at all, and an int4 dot never reaches shared memory, so
+    // charging per dot operand would bill both of those for a buffer that is
+    // never allocated.
+    //
+    // Only conversions defined outside this loop are counted, and only when a
+    // user is directly inside it. Those stage once and stay live across every
+    // iteration, so they compete with the pipeline for the budget.
+    //
+    // Two shapes are deliberately not modelled, both of which make this
+    // estimate low rather than high: a candidate produced inside the loop, and
+    // one that reaches the loop through an intervening op (a select, another
+    // conversion) so that no direct user is in the loop. Telling those apart
+    // from short-lived conversions the allocator will overlap needs provenance
+    // and liveness analysis that does not belong in this pass; underestimating
+    // only returns the loop to the pre-clamp behaviour, which is the same
+    // trade-off documented for the rest of this function.
+    //
+    // RDD's transposed-operand reuse does not double-count here, and not
+    // because of the loop check: its second conversion targets a linear
+    // layout, which is exactly why RDD has to special-case it, so the helper
+    // below rejects it and only the primary dot-operand conversion is billed.
+    scope->walk([&](ttg::ConvertLayoutOp cvt) {
+      if (forOp->isAncestor(cvt))
+        return;
+      std::optional<ttg::MemDescType> bufTy =
+          getReduceDataDuplicationBufferType(cvt);
+      if (!bufTy)
+        return;
+      if (!llvm::any_of(cvt->getUsers(), [&](Operation *user) {
+            return forOp->isAncestor(user);
+          }))
+        return;
+      staticBytes += memDescBytes(*bufTy);
+    });
+
     int64_t budget = kSm75SharedMemoryBudget - staticBytes;
     unsigned clamped = loadLatency;
+    // `>`, not `>=`: the allocator lets a kernel use the limit exactly, and
+    // measured configurations do land on 65536 B legitimately. `>=` would
+    // demote those for no gain -- it is not a safety margin, it only punishes
+    // exact equality while an estimate that lands one byte short still passes.
+    // Anything this estimate cannot see (alignment gaps between buffers,
+    // conversion scratch) stays unmodelled rather than papered over here.
     while (clamped > 0 && bytesPerSlot * clamped > budget)
       --clamped;
     if (clamped != loadLatency)
@@ -160,7 +223,45 @@ private:
                                           << " (" << bytesPerSlot
                                           << "B/slot, " << staticBytes
                                           << "B static)");
+    // Reducing the depth is routine -- it is what an autotuner would do. Losing
+    // the pipeline outright is not: num_stages then has no effect at all, and
+    // the only symptom is that raising it does not make the kernel faster. Say
+    // so, or that stays invisible outside a debug build.
+    if (clamped == 0 && loadLatency > 0)
+      forOp->emitRemark()
+          << "sm75: software pipelining disabled for this loop. One stage of "
+             "multibuffering is estimated at "
+          << bytesPerSlot
+          << " B, and an estimated " << staticBytes
+          << " B of Turing's 64KB/CTA shared memory is already committed to "
+             "non-pipeline allocations, leaving no room for even a single "
+             "stage. num_stages has no effect here. Both figures are "
+             "estimates made before shared memory is allocated, so the real "
+             "footprint may differ.";
     return clamped;
+  }
+
+  // Mirrors how Allocation.cpp sizes a shared buffer (the padded vs
+  // getAllocationShapePerCTA split there), so the clamp's view of a
+  // ReduceDataDuplication staging buffer matches the allocator's.
+  //
+  // Alignment is deliberately not modelled: the allocator aligns offsets and
+  // reuses addresses across non-overlapping live ranges, so summing each
+  // buffer rounded up to 16 B would over-count rather than add safety.
+  static int64_t memDescBytes(ttg::MemDescType ty) {
+    int64_t numElems;
+    if (auto padded =
+            dyn_cast<ttg::PaddedSharedEncodingAttr>(ty.getEncoding())) {
+      numElems = padded.getPaddedSize(ttg::getShapePerCTA(ty));
+    } else {
+      numElems = 1;
+      for (int64_t d : ttg::getAllocationShapePerCTA(ty))
+        numElems *= d;
+    }
+    Type elemTy = ty.getElementType();
+    int64_t elemBits =
+        elemTy.isIntOrFloat() ? elemTy.getIntOrFloatBitWidth() : 64;
+    return numElems * elemBits / 8;
   }
 
   static int64_t tensorBytes(RankedTensorType ty) {
