@@ -88,18 +88,23 @@ SM, and buys back less than the occupancy it costs.
 
 The sm75 software pipeline (the first ever implemented for Turing) helps
 **latency-exposed** kernels — FlashAttention (**+48 % fwd / +11 % bwd on head_dim=128**,
-**+11 % fwd on head_dim=64**) and grouped/MoE GEMM (**+20 %**) — but not the
-compute-bound dense GEMM, where the Tensor Cores are already saturated and load
-latency is hidden by ILP. Kernels with no reduction loop to pipeline (layernorm,
-softmax, elementwise) are not applicable.
+**+11 % fwd on head_dim=64**) and grouped/MoE GEMM (**+20 %**) — but not dense
+GEMM. That is not because its Tensor Cores are saturated: at `num_stages=1`
+dense GEMM is itself latency-exposed, stalling on memory far more than cuBLAS
+does. Pipelining does relieve that — it just costs more than it saves (below).
+Kernels with no reduction loop to pipeline (layernorm, softmax, elementwise) are
+not applicable.
 
 Pipeline depth (`num_stages`) is configurable — not limited to double-buffering —
 and autotuned per kernel and size. Turing's small 64 KB/CTA shared memory caps the
 useful depth: for the kernels that benefit from pipelining, **`num_stages=2` is the
 sweet spot**, because a third stage usually exceeds the budget (it OOMs for
-FlashAttention). The compute-bound dense GEMM is the exception — it is fastest with
-no pipelining (`num_stages=1`), a third stage edging a few percent ahead only at the
-largest 4096³ size.
+FlashAttention). Dense GEMM is the exception — fastest with no pipelining
+(`num_stages=1`), a third stage edging ~1 % ahead only at the largest 4096³ size.
+The cause is the register file, not saturation: a 128×128 tile over 4 warps
+spends 128 of Turing's 255 registers per thread on the f32 accumulator alone, so
+enabling the pipeline pushes it past the ceiling and the global-load pointers
+spill — reloaded seven times per iteration.
 
 A runnable INT8/INT4 example is in
 [`python/tutorials/12-turing-integer-matmul.py`](python/tutorials/12-turing-integer-matmul.py).
