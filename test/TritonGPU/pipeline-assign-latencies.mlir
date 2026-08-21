@@ -1385,3 +1385,182 @@ tt.func @sm75_subelement_load_not_pipelined(%lb : index, %ub : index, %step : in
   tt.return %loop#2: tensor<128x128xi32, #C>
 }
 }
+
+
+// -----
+
+#AL = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#BL = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+#C = #ttg.nvidia_mma<{versionMajor = 2, warpsPerCTA = [4, 1], instrShape = [16, 8]}>
+#A = #ttg.dot_op<{opIdx = 0, parent = #C, kWidth=2}>
+#B = #ttg.dot_op<{opIdx = 1, parent = #C, kWidth=2}>
+
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32, ttg.target = "cuda:75"} {
+// A scalar load that feeds a dot operand is pipelined like any other load and
+// gets a buffer slot per stage, so its bytes have to be counted. Skipping
+// non-tensor results looks safe but is not: this is SageAttention's
+// `k_scale = tl.load(K_scale_ptr)` shape, and the bytes it contributes were
+// enough to push a kernel past 64 KB after the clamp had declared it fit.
+//
+// The two 128x128 fp16 loads are 65536 B per slot, which fits exactly once.
+// The f16 scalar makes it 65538, so not even one slot fits.
+// CHECK-LABEL: @sm75_scalar_load_counted
+// CHECK-NOT: tt.latency
+tt.func @sm75_scalar_load_counted(%lb : index, %ub : index, %step : index,
+                  %scale_ptr : !tt.ptr<f16>,
+                  %a_ptr_init : tensor<128x128x!tt.ptr<f16>, #AL> {tt.divisibility = dense<[16, 16]> : tensor<2xi32>, tt.contiguity = dense<[1, 128]> : tensor<2xi32>},
+                  %b_ptr_init : tensor<128x128x!tt.ptr<f16>, #BL> {tt.divisibility = dense<[16, 16]> : tensor<2xi32>, tt.contiguity = dense<[1, 128]> : tensor<2xi32>}) -> tensor<128x128xf32, #C> {
+  %c_init = arith.constant dense<0.00e+00> : tensor<128x128xf32, #C>
+  %a_off = arith.constant dense<4> : tensor<128x128xi32, #AL>
+  %b_off = arith.constant dense<4> : tensor<128x128xi32, #BL>
+  %loop:3 = scf.for %iv = %lb to %ub step %step iter_args(%a_ptr = %a_ptr_init, %b_ptr = %b_ptr_init, %prev_c = %c_init) -> (tensor<128x128x!tt.ptr<f16>, #AL>, tensor<128x128x!tt.ptr<f16>, #BL>, tensor<128x128xf32, #C>) {
+    %scale = tt.load %scale_ptr : !tt.ptr<f16>
+    %scale_t = tt.splat %scale : f16 -> tensor<128x128xf16, #AL>
+    %a_ = tt.load %a_ptr : tensor<128x128x!tt.ptr<f16>, #AL>
+    %a_s = arith.mulf %a_, %scale_t : tensor<128x128xf16, #AL>
+    %a = ttg.convert_layout %a_s : tensor<128x128xf16, #AL> -> tensor<128x128xf16, #A>
+    %b_ = tt.load %b_ptr : tensor<128x128x!tt.ptr<f16>, #BL>
+    %b = ttg.convert_layout %b_ : tensor<128x128xf16, #BL> -> tensor<128x128xf16, #B>
+    %c = tt.dot %a, %b, %prev_c : tensor<128x128xf16, #A> * tensor<128x128xf16, #B> -> tensor<128x128xf32, #C>
+    %next_a_ptr = tt.addptr %a_ptr, %a_off : tensor<128x128x!tt.ptr<f16>, #AL>, tensor<128x128xi32, #AL>
+    %next_b_ptr = tt.addptr %b_ptr, %b_off : tensor<128x128x!tt.ptr<f16>, #BL>, tensor<128x128xi32, #BL>
+    scf.yield %next_a_ptr, %next_b_ptr, %c : tensor<128x128x!tt.ptr<f16>, #AL>, tensor<128x128x!tt.ptr<f16>, #BL>, tensor<128x128xf32, #C>
+  }
+  tt.return %loop#2: tensor<128x128xf32, #C>
+}
+}
+
+// -----
+
+#AL = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#BL = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+#C = #ttg.nvidia_mma<{versionMajor = 2, warpsPerCTA = [4, 1], instrShape = [16, 8]}>
+#A = #ttg.dot_op<{opIdx = 0, parent = #C, kWidth=2}>
+#B = #ttg.dot_op<{opIdx = 1, parent = #C, kWidth=2}>
+
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32, ttg.target = "cuda:75"} {
+// The budget comparison is `>`, not `>=`. Two 128x128 fp16 loads are exactly
+// 65536 B per slot, which is exactly the limit; the allocator accepts a kernel
+// that uses the limit exactly, so one slot must survive. A `>=` here would
+// demote this loop for no gain -- it is not a safety margin, it only punishes
+// landing on the boundary while an estimate one byte short still passes.
+// CHECK-LABEL: @sm75_exact_budget_not_demoted
+tt.func @sm75_exact_budget_not_demoted(%lb : index, %ub : index, %step : index,
+                  %a_ptr_init : tensor<128x128x!tt.ptr<f16>, #AL> {tt.divisibility = dense<[16, 16]> : tensor<2xi32>, tt.contiguity = dense<[1, 128]> : tensor<2xi32>},
+                  %b_ptr_init : tensor<128x128x!tt.ptr<f16>, #BL> {tt.divisibility = dense<[16, 16]> : tensor<2xi32>, tt.contiguity = dense<[1, 128]> : tensor<2xi32>}) -> tensor<128x128xf32, #C> {
+  %c_init = arith.constant dense<0.00e+00> : tensor<128x128xf32, #C>
+  %a_off = arith.constant dense<4> : tensor<128x128xi32, #AL>
+  %b_off = arith.constant dense<4> : tensor<128x128xi32, #BL>
+  %loop:3 = scf.for %iv = %lb to %ub step %step iter_args(%a_ptr = %a_ptr_init, %b_ptr = %b_ptr_init, %prev_c = %c_init) -> (tensor<128x128x!tt.ptr<f16>, #AL>, tensor<128x128x!tt.ptr<f16>, #BL>, tensor<128x128xf32, #C>) {
+    // CHECK: tt.load {{.*}} {tt.latency = 1 : i32}
+    %a_ = tt.load %a_ptr : tensor<128x128x!tt.ptr<f16>, #AL>
+    %a = ttg.convert_layout %a_ : tensor<128x128xf16, #AL> -> tensor<128x128xf16, #A>
+    // CHECK: tt.load {{.*}} {tt.latency = 1 : i32}
+    %b_ = tt.load %b_ptr : tensor<128x128x!tt.ptr<f16>, #BL>
+    %b = ttg.convert_layout %b_ : tensor<128x128xf16, #BL> -> tensor<128x128xf16, #B>
+    %c = tt.dot %a, %b, %prev_c : tensor<128x128xf16, #A> * tensor<128x128xf16, #B> -> tensor<128x128xf32, #C>
+    %next_a_ptr = tt.addptr %a_ptr, %a_off : tensor<128x128x!tt.ptr<f16>, #AL>, tensor<128x128xi32, #AL>
+    %next_b_ptr = tt.addptr %b_ptr, %b_off : tensor<128x128x!tt.ptr<f16>, #BL>, tensor<128x128xi32, #BL>
+    scf.yield %next_a_ptr, %next_b_ptr, %c : tensor<128x128x!tt.ptr<f16>, #AL>, tensor<128x128x!tt.ptr<f16>, #BL>, tensor<128x128xf32, #C>
+  }
+  tt.return %loop#2: tensor<128x128xf32, #C>
+}
+}
+
+
+
+// -----
+
+#AL = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#BL = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+#C = #ttg.nvidia_mma<{versionMajor = 2, warpsPerCTA = [4, 1], instrShape = [16, 8]}>
+#A = #ttg.dot_op<{opIdx = 0, parent = #C, kWidth=2}>
+#B = #ttg.dot_op<{opIdx = 1, parent = #C, kWidth=2}>
+
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32, ttg.target = "cuda:75"} {
+// ReduceDataDuplication stages a dot operand through shared memory, but it runs
+// 16 passes after this one, so the buffer it will create is not in the IR yet.
+// The clamp has to predict it or the budget comes out too generous -- that is
+// exactly what let SageAttention's _attn_fwd overflow 64 KB: a loop-invariant
+// q operand whose staging buffer this pass could not see.
+//
+// Loads are 128x64 + 64x128 fp16 = 32768 B per slot, so latency 2 needs 65536 B
+// and fits the bare 64 KB exactly. The hoisted 64x256 fp16 operand claims
+// 32768 B of that, leaving room for one slot. Deleting just the conversion
+// restores latency 2, so this pins the charge and not the arithmetic.
+// CHECK-LABEL: @sm75_rdd_conversion_charged
+tt.func @sm75_rdd_conversion_charged(%lb : index, %ub : index, %step : index,
+                  %q_init : tensor<64x256xf16, #BL>,
+                  %a_ptr_init : tensor<128x64x!tt.ptr<f16>, #AL> {tt.divisibility = dense<[16, 16]> : tensor<2xi32>, tt.contiguity = dense<[1, 64]> : tensor<2xi32>},
+                  %b_ptr_init : tensor<64x128x!tt.ptr<f16>, #BL> {tt.divisibility = dense<[16, 16]> : tensor<2xi32>, tt.contiguity = dense<[1, 128]> : tensor<2xi32>}) -> tensor<128x128xf32, #C> {
+  %c_init = arith.constant dense<0.00e+00> : tensor<128x128xf32, #C>
+  %z_init = arith.constant dense<0.00e+00> : tensor<128x256xf32, #C>
+  %a_off = arith.constant dense<4> : tensor<128x64xi32, #AL>
+  %b_off = arith.constant dense<4> : tensor<64x128xi32, #BL>
+  %q = ttg.convert_layout %q_init : tensor<64x256xf16, #BL> -> tensor<64x256xf16, #B>
+  %loop:3 = scf.for %iv = %lb to %ub step %step iter_args(%a_ptr = %a_ptr_init, %b_ptr = %b_ptr_init, %prev_c = %c_init) -> (tensor<128x64x!tt.ptr<f16>, #AL>, tensor<64x128x!tt.ptr<f16>, #BL>, tensor<128x128xf32, #C>) {
+    // CHECK: tt.load {{.*}} {tt.latency = 1 : i32}
+    %a_ = tt.load %a_ptr : tensor<128x64x!tt.ptr<f16>, #AL>
+    %a = ttg.convert_layout %a_ : tensor<128x64xf16, #AL> -> tensor<128x64xf16, #A>
+    // CHECK: tt.load {{.*}} {tt.latency = 1 : i32}
+    %b_ = tt.load %b_ptr : tensor<64x128x!tt.ptr<f16>, #BL>
+    %b = ttg.convert_layout %b_ : tensor<64x128xf16, #BL> -> tensor<64x128xf16, #B>
+    %c = tt.dot %a, %b, %prev_c : tensor<128x64xf16, #A> * tensor<64x128xf16, #B> -> tensor<128x128xf32, #C>
+    %qc = tt.dot %a, %q, %z_init : tensor<128x64xf16, #A> * tensor<64x256xf16, #B> -> tensor<128x256xf32, #C>
+    "use"(%qc) : (tensor<128x256xf32, #C>) -> ()
+    %next_a_ptr = tt.addptr %a_ptr, %a_off : tensor<128x64x!tt.ptr<f16>, #AL>, tensor<128x64xi32, #AL>
+    %next_b_ptr = tt.addptr %b_ptr, %b_off : tensor<64x128x!tt.ptr<f16>, #BL>, tensor<64x128xi32, #BL>
+    scf.yield %next_a_ptr, %next_b_ptr, %c : tensor<128x64x!tt.ptr<f16>, #AL>, tensor<64x128x!tt.ptr<f16>, #BL>, tensor<128x128xf32, #C>
+  }
+  tt.return %loop#2: tensor<128x128xf32, #C>
+}
+}
+
+// -----
+
+#AL = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#BL = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+#C = #ttg.nvidia_mma<{versionMajor = 2, warpsPerCTA = [4, 1], instrShape = [16, 8]}>
+#A = #ttg.dot_op<{opIdx = 0, parent = #C, kWidth=2}>
+#B = #ttg.dot_op<{opIdx = 1, parent = #C, kWidth=2}>
+
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32, ttg.target = "cuda:75"} {
+// Only conversions ReduceDataDuplication will actually stage through shared
+// memory are charged, and RDD keys on the destination being a dot operand. A
+// conversion to any other layout must not be billed for a buffer that is never
+// allocated. This is not academic on Turing:
+//
+//   * a bf16 or f32 dot falls back to FMA and has no dot-operand conversion,
+//   * an int4 dot never reaches shared memory at all,
+//   * RDD's own transposed-operand reuse feeds the transpose through a linear
+//     layout, so the second conversion is not a dot operand either and the
+//     buffer is not double-counted.
+//
+// Same shape as @sm75_rdd_conversion_charged, whose 64x256 hoisted operand cost
+// it a stage; here the identical tensor converts to a blocked layout instead
+// and latency 2 survives.
+// CHECK-LABEL: @sm75_non_dot_operand_conversion_not_charged
+tt.func @sm75_non_dot_operand_conversion_not_charged(%lb : index, %ub : index, %step : index,
+                  %q_init : tensor<64x256xf16, #BL>,
+                  %a_ptr_init : tensor<128x64x!tt.ptr<f16>, #AL> {tt.divisibility = dense<[16, 16]> : tensor<2xi32>, tt.contiguity = dense<[1, 64]> : tensor<2xi32>},
+                  %b_ptr_init : tensor<64x128x!tt.ptr<f16>, #BL> {tt.divisibility = dense<[16, 16]> : tensor<2xi32>, tt.contiguity = dense<[1, 128]> : tensor<2xi32>}) -> tensor<128x128xf32, #C> {
+  %c_init = arith.constant dense<0.00e+00> : tensor<128x128xf32, #C>
+  %a_off = arith.constant dense<4> : tensor<128x64xi32, #AL>
+  %b_off = arith.constant dense<4> : tensor<64x128xi32, #BL>
+  %qb = ttg.convert_layout %q_init : tensor<64x256xf16, #BL> -> tensor<64x256xf16, #AL>
+  %loop:3 = scf.for %iv = %lb to %ub step %step iter_args(%a_ptr = %a_ptr_init, %b_ptr = %b_ptr_init, %prev_c = %c_init) -> (tensor<128x64x!tt.ptr<f16>, #AL>, tensor<64x128x!tt.ptr<f16>, #BL>, tensor<128x128xf32, #C>) {
+    // CHECK: tt.load {{.*}} {tt.latency = 2 : i32}
+    %a_ = tt.load %a_ptr : tensor<128x64x!tt.ptr<f16>, #AL>
+    %a = ttg.convert_layout %a_ : tensor<128x64xf16, #AL> -> tensor<128x64xf16, #A>
+    // CHECK: tt.load {{.*}} {tt.latency = 2 : i32}
+    %b_ = tt.load %b_ptr : tensor<64x128x!tt.ptr<f16>, #BL>
+    %b = ttg.convert_layout %b_ : tensor<64x128xf16, #BL> -> tensor<64x128xf16, #B>
+    %c = tt.dot %a, %b, %prev_c : tensor<128x64xf16, #A> * tensor<64x128xf16, #B> -> tensor<128x128xf32, #C>
+    "use"(%qb) : (tensor<64x256xf16, #AL>) -> ()
+    %next_a_ptr = tt.addptr %a_ptr, %a_off : tensor<128x64x!tt.ptr<f16>, #AL>, tensor<128x64xi32, #AL>
+    %next_b_ptr = tt.addptr %b_ptr, %b_off : tensor<64x128x!tt.ptr<f16>, #BL>, tensor<64x128xi32, #BL>
+    scf.yield %next_a_ptr, %next_b_ptr, %c : tensor<128x64x!tt.ptr<f16>, #AL>, tensor<64x128x!tt.ptr<f16>, #BL>, tensor<128x128xf32, #C>
+  }
+  tt.return %loop#2: tensor<128x128xf32, #C>
+}
+}
