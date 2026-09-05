@@ -143,6 +143,8 @@ class CUDAOptions:
     sanitize_overflow: bool = True
     arch: str = None
     instrumentation_mode: str = ""
+    # sm75 only: run bf16 dots on the fp16 tensor core (see knobs.nvidia)
+    sm75_bf16_dot_as_f16: bool = False
 
     def __post_init__(self):
         default_libdir = Path(__file__).parent / 'lib'
@@ -213,6 +215,9 @@ class CUDABackend(BaseBackend):
         if "enable_fp_fusion" not in args:
             args["enable_fp_fusion"] = knobs.language.default_fp_fusion
 
+        if "sm75_bf16_dot_as_f16" not in args:
+            args["sm75_bf16_dot_as_f16"] = capability == 75 and knobs.nvidia.sm75_bf16_dot_as_f16
+
         args["max_num_imprecise_acc_default"] = 2**30 if capability == 90 else 0
 
         return CUDAOptions(**args)
@@ -277,7 +282,7 @@ class CUDABackend(BaseBackend):
         nvidia.passes.ttnvgpuir.add_plan_cta(pm)
         passes.ttgpuir.add_remove_layout_conversions(pm)
         passes.ttgpuir.add_optimize_thread_locality(pm)
-        passes.ttgpuir.add_accelerate_matmul(pm)
+        passes.ttgpuir.add_accelerate_matmul(pm, opt.sm75_bf16_dot_as_f16)
         passes.ttgpuir.add_remove_layout_conversions(pm)
         passes.ttgpuir.add_optimize_dot_operands(pm, capability >= 75)
         nvidia.passes.ttnvgpuir.add_optimize_descriptor_encoding(pm)

@@ -31,7 +31,8 @@ namespace gpu {
 namespace {
 
 // Get the highest version supported for the hardware and the dot.
-static int getMMAVersionSafe(int computeCapability, DotOp op) {
+static int getMMAVersionSafe(int computeCapability, DotOp op,
+                             bool sm75Bf16DotAsF16 = false) {
   // List supported mma version in order of preference.
   SmallVector<int> versionsSupported;
   if (computeCapability < 75) {
@@ -59,9 +60,15 @@ static int getMMAVersionSafe(int computeCapability, DotOp op) {
       if (computeCapability < 80) {
         auto aElemTy = op.getA().getType().getElementType();
         auto bElemTy = op.getB().getType().getElementType();
-        // bf16 needs Ampere+.
-        if (aElemTy.isBF16() || bElemTy.isBF16())
-          continue;
+        // bf16 needs Ampere+. sm75Bf16DotAsF16 opts into running it on the
+        // fp16 tensor core anyway: bf16's 8 mantissa bits are exactly
+        // representable in fp16, so decomposeMixedModeDotOp can convert the
+        // operands losslessly. What is lost is range -- fp16 tops out at
+        // 65504 where bf16 reaches ~3e38 -- so this is off by default.
+        if (aElemTy.isBF16() || bElemTy.isBF16()) {
+          if (!(sm75Bf16DotAsF16 && computeCapability == 75))
+            continue;
+        }
         // supportMMA() admits f32 operands whenever the dot asks for TF32 --
         // which is tl.dot's default -- but Turing has no TF32 tensor core;
         // mma.sync...f32.tf32.tf32.f32 is sm80+.
@@ -414,12 +421,15 @@ static Value convertDotOperandForMMA(Value v, int opIdx, int bitwidth,
 
 class BlockedToMMA : public mlir::OpRewritePattern<DotOp> {
   int computeCapability;
+  bool sm75Bf16DotAsF16;
   mutable llvm::DenseMap<Operation *, unsigned> dotOpInstNs;
 
 public:
-  BlockedToMMA(mlir::MLIRContext *context, int computeCapability, int benefit)
+  BlockedToMMA(mlir::MLIRContext *context, int computeCapability, int benefit,
+               bool sm75Bf16DotAsF16 = false)
       : OpRewritePattern<DotOp>(context, benefit),
-        computeCapability(computeCapability) {}
+        computeCapability(computeCapability),
+        sm75Bf16DotAsF16(sm75Bf16DotAsF16) {}
 
   mlir::LogicalResult
   matchAndRewrite(triton::DotOp dotOp,
@@ -447,7 +457,8 @@ public:
       return failure();
     }
 
-    auto mmaVersion = getMMAVersionSafe(computeCapability, dotOp);
+    auto mmaVersion =
+        getMMAVersionSafe(computeCapability, dotOp, sm75Bf16DotAsF16);
     auto mmaResult =
         createMMAEncodingForDot(dotOp, rewriter, computeCapability, mmaVersion);
     if (!(mmaResult.versionMajor >= 1 && mmaResult.versionMajor <= 3))
@@ -950,8 +961,22 @@ static Value promoteOperand(OpBuilder &builder, Location loc, Value operand,
                                 .cloneWith(std::nullopt, promotedType);
   Type operandElType =
       cast<RankedTensorType>(operand.getType()).getElementType();
+  if (operandElType == promotedType)
+    return operand;
   if (type::isFloat8(operandElType)) {
     return FpToFpOp::create(builder, loc, tensorPromotedType, operand);
+  }
+  // bf16 -> f16 is not an extension: same width, and neither the frontend
+  // (semantic.py routes every bf16 <-> f16 cast through f32) nor the NVIDIA
+  // lowering tables have a direct conversion. Go through f32 as well.
+  if (operandElType.isBF16() && promotedType.isF16()) {
+    Type f32TensorType = cast<RankedTensorType>(operand.getType())
+                             .cloneWith(std::nullopt, builder.getF32Type());
+    Value asF32 =
+        arith::ExtFOp::create(builder, loc, f32TensorType, operand);
+    return FpToFpOp::create(
+        builder, loc, tensorPromotedType, asF32,
+        RoundingModeAttr::get(builder.getContext(), RoundingMode::RTNE));
   }
   return arith::ExtFOp::create(builder, loc, tensorPromotedType, operand);
 }
@@ -975,6 +1000,18 @@ static void decomposeMixedModeDotOp(ModuleOp mod, int computeCapability) {
     NvidiaMmaEncodingAttr mmaLayout =
         dyn_cast<NvidiaMmaEncodingAttr>(D.getType().getEncoding());
     if (mmaLayout) {
+      // A bf16 dot only reaches here with an MMA layout on Turing when
+      // sm75-bf16-dot-as-f16 let it through getMMAVersionSafe. Turing's
+      // mma.sync has no bf16 form, so convert the operands to fp16 and let it
+      // issue m16n8k8; the accumulator stays fp32.
+      if (mmaLayout.isTuring() && (AElType.isBF16() ||
+                                   dotOp.getB().getType().getElementType().isBF16())) {
+        promoteType = builder.getF16Type();
+        Location loc = dotOp.getLoc();
+        dotOp.setOperand(0, promoteOperand(builder, loc, dotOp.getA(), promoteType));
+        dotOp.setOperand(1, promoteOperand(builder, loc, dotOp.getB(), promoteType));
+        return;
+      }
       bool isNativeFP8 = llvm::isa<Float8E5M2Type, Float8E4M3FNType>(AElType);
       // promote to f16 unless there's hardware support for fp8 operands
       if (!isNativeFP8 ||
@@ -1057,7 +1094,8 @@ public:
     constexpr int benefitMMAv5 = 10;
     constexpr int benefitSM120 = 10;
 
-    patterns.add<BlockedToMMA>(context, computeCapability, benefitDefault);
+    patterns.add<BlockedToMMA>(context, computeCapability, benefitDefault,
+                               sm75Bf16DotAsF16);
     patterns.add<ScaledBlockedToMMA>(context, computeCapability, benefitSM120);
     populateDecomposeScaledBlockedPatterns(patterns, benefitDefault);
     patterns.add<BlockedToMMAv5, ScaledBlockedToMMAv5>(
