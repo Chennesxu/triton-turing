@@ -21,6 +21,7 @@ Upstream Triton supports Turing's MMA instructions, but critical optimizations w
 | int8 GEMM (`m8n8k16`) | ✅ Done |
 | int4 MMA (`m8n8k32`) — first usable pure-int4 matmul in Triton | ✅ Done |
 | FlashAttention-2 forward + backward (pipelined) | ✅ Done |
+| bf16 dot on the fp16 Tensor Core — opt-in, see below | ✅ Done |
 
 ## Performance
 
@@ -81,6 +82,29 @@ Grouped (MoE) GEMM runs **+5–10 %** faster than the upstream configuration,
 almost all of it from using two pipeline stages instead of three: the third
 stage pushes a 128×128×32 tile past the 32 KB that lets two CTAs share a Turing
 SM, and buys back less than the occupancy it costs.
+
+### bf16 — an opt-in Tensor Core path
+
+Turing's `mma.sync` has no bf16 form, so a bf16 `tl.dot` falls back to CUDA-core
+FMA. bf16 is the default dtype for vLLM, SGLang and most Hugging Face
+checkpoints, so a large share of real workloads never touch the Tensor Cores.
+
+`TRITON_SM75_BF16_DOT_AS_F16=1` converts bf16 dot operands to fp16 and issues
+`m16n8k8`, accumulating in fp32:
+
+| GEMM | FMA | Tensor Core | Speedup |
+|---|---|---|---|
+| 1024³ | 0.742 ms | 0.060 ms | **12.4×** |
+| 2048³ | 7.682 ms | 0.433 ms | **17.7×** |
+| 4096³ | 63.481 ms | 4.828 ms | **13.1×** |
+
+It is **off by default because it changes numerics.** bf16's 8 mantissa bits fit
+fp16 exactly, so operands inside fp16's normal range — 6.1e-5 to 65504 — convert
+losslessly. Outside it both ends degrade: smaller values fall into fp16
+subnormals and lose precision (relative error reaches 2.5e-2 at magnitude 1e-6),
+larger ones become `inf`. A model that uses bf16 *because* fp16 overflows is
+exactly what this breaks, and upstream's dot tests pass either way — check your
+own outputs before enabling it.
 
 ### When the software pipeline helps
 
