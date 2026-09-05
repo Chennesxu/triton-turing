@@ -21,11 +21,18 @@ Upstream also does not build on Windows. This branch addresses both.
 | int8 GEMM (`m8n8k16`) | ✅ |
 | int4 MMA (`m8n8k32`) — first usable pure-int4 matmul in Triton | ✅ |
 | FlashAttention-2 forward + backward (pipelined) | ✅ |
+| bf16 dot on the fp16 Tensor Core — opt-in, `TRITON_SM75_BF16_DOT_AS_F16=1` | ✅ |
 
 Benchmarks and the reasoning behind each result are on the
 [`main` branch](https://github.com/Chennesxu/triton-turing). **They were all
 measured on Linux, on a Titan RTX** — nothing here has been benchmarked on
 Windows, and the numbers should not be read as Windows results.
+
+Turing has no bf16 Tensor Core, so a bf16 `tl.dot` falls back to CUDA-core FMA.
+`TRITON_SM75_BF16_DOT_AS_F16=1` converts the operands to fp16 and issues
+`m16n8k8` instead — 12-18x faster on Linux, but **off by default because it
+changes numerics**: operands below 6.1e-5 lose precision to fp16 subnormals and
+operands above 65504 become `inf`. See the `main` branch README.
 
 A runnable INT8/INT4 example is in
 [`python/tutorials/12-turing-integer-matmul.py`](python/tutorials/12-turing-integer-matmul.py).
