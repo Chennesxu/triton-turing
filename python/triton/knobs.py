@@ -512,6 +512,13 @@ class nvidia_knobs(base_knobs):
     libdevice_path: env_opt_str = env_opt_str("TRITON_LIBDEVICE_PATH")
     libcuda_path: env_opt_str = env_opt_str("TRITON_LIBCUDA_PATH")
 
+    # Turing has no bf16 tensor core. When set, bf16 dots on sm75 convert their
+    # operands to fp16 and issue m16n8k8 instead of falling back to FMA. bf16's
+    # 8 mantissa bits fit fp16 exactly, so this costs no precision, but fp16's
+    # exponent range is much narrower: operands above 65504 become inf. Off by
+    # default because that changes numerics silently.
+    sm75_bf16_dot_as_f16: env_bool = env_bool("TRITON_SM75_BF16_DOT_AS_F16", False)
+
 
 class amd_knobs(base_knobs):
     use_buffer_ops: env_bool = env_bool("AMDGCN_USE_BUFFER_OPS", True)

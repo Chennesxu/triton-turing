@@ -211,6 +211,14 @@ def TritonGPUAccelerateMatmul : Pass<"tritongpu-accelerate-matmul", "mlir::Modul
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
                            "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
                            "mlir::triton::TritonDialect"];
+
+  let options = [
+    Option<"sm75Bf16DotAsF16", "sm75-bf16-dot-as-f16",
+           "bool", /*default*/"false",
+           "on sm75, give bf16 dots an MMA layout and convert their operands to "
+           "fp16 so they issue m16n8k8 instead of falling back to FMA; trades "
+           "bf16's exponent range for tensor-core throughput">
+  ];
 }
 
 def TritonGPUOptimizeDotOperands : Pass<"tritongpu-optimize-dot-operands", "mlir::ModuleOp"> {
