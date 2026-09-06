@@ -461,6 +461,11 @@ class CUDABackend(BaseBackend):
         metadata["global_scratch_align"] = src.get_int_attr("ttg.global_scratch_memory_alignment")
         metadata["profile_scratch_size"] = src.get_int_attr("ttg.profile_scratch_memory_size") or 0
         metadata["profile_scratch_align"] = src.get_int_attr("ttg.profile_scratch_memory_alignment") or 1
+        # Real pipeline depth on sm75. `shared` cannot answer "did my
+        # num_stages take effect?" -- at 128x128x32 fp16, num_stages 1, 2 and 3
+        # all report 32768 B while getting 0, 1 and 2 slots. These do.
+        metadata["sm75_pipeline_slots"] = src.get_int_attr("ttg.sm75_pipeline_slots")
+        metadata["sm75_pipeline_slots_requested"] = src.get_int_attr("ttg.sm75_pipeline_slots_requested")
         ret = str(llvm_mod)
         del llvm_mod
         del context
