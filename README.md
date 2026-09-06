@@ -34,6 +34,26 @@ Turing has no bf16 Tensor Core, so a bf16 `tl.dot` falls back to CUDA-core FMA.
 changes numerics**: operands below 6.1e-5 lose precision to fp16 subnormals and
 operands above 65504 become `inf`. See the `main` branch README.
 
+Turing's 64 KB/CTA shared memory caps how deep the software pipeline can go,
+and the cap is applied silently — so the `num_stages` you ask for is often not
+the depth you get. On a 128×128×64 tile, `num_stages` 3 and 4 compile to the
+same kernel: 4 asks for 3 slots at 98304 B, over the limit, and gets clamped
+back to 2. Any difference you measure between them is noise. Two ways to see
+the real depth:
+
+```shell
+TRITON_SM75_DUMP_PIPELINE_DEPTH=1 python your_script.py
+# sm75 pipeline: matmul_kernel at your_script.py:12
+#   num_stages=4 -> prefetching 2 iterations ahead, 2 shared slots (65536 B)
+#     [CLAMPED from 3; that would need 98304 B, over the 65536 B available]
+#   identical codegen to num_stages=3
+```
+
+```python
+kernel.metadata.sm75_pipeline_slots            # what you got
+kernel.metadata.sm75_pipeline_slots_requested  # what you asked for
+```
+
 A runnable INT8/INT4 example is in
 [`python/tutorials/12-turing-integer-matmul.py`](python/tutorials/12-turing-integer-matmul.py).
 
