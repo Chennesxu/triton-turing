@@ -57,6 +57,7 @@ void assignUserProvidedLatencies(scf::ForOp forOp,
 }
 
 class AssignLoadLatencies {
+  static constexpr int64_t kSm75SharedMemoryBudget = 64 * 1024;
 public:
   AssignLoadLatencies(scf::ForOp forOp, int numStages,
                       DenseMap<Operation *, int> &opLatency,
@@ -82,8 +83,13 @@ public:
       maxIndirectionLevel = std::max(maxIndirectionLevel, info.first);
     unsigned loadLatency = (numStages - 1) / (maxIndirectionLevel + 1);
 
-    if (computeCapability == 75)
-      loadLatency = clampLatencyToSharedMemory(loadOpToIndLevel, loadLatency);
+    if (computeCapability == 75) {
+      unsigned requested = loadLatency;
+      ClampResult clamped =
+          clampLatencyToSharedMemory(loadOpToIndLevel, loadLatency);
+      loadLatency = clamped.latency;
+      reportPipelineDepth(clamped, requested);
+    }
     if (loadLatency == 0)
       return;
 
@@ -106,11 +112,17 @@ private:
   // hard limit after subtracting shared memory the loop already commits to
   // (e.g. loop-invariant dot operand staging), down to 0 (no pipelining),
   // which leaves the loop as it would be without the pipeliner.
-  unsigned clampLatencyToSharedMemory(
+  // What the clamp decided, for reportPipelineDepth to quote.
+  struct ClampResult {
+    unsigned latency;
+    int64_t bytesPerSlot;
+    int64_t staticBytes;
+  };
+
+  ClampResult clampLatencyToSharedMemory(
       const llvm::MapVector<Operation *, std::pair<int, Operation *>>
           &loadOpToIndLevel,
       unsigned loadLatency) {
-    constexpr int64_t kSm75SharedMemoryBudget = 64 * 1024;
 
     // Count scalar loads too. Skipping anything that is not a RankedTensorType
     // used to look safe, but the pipeliner buffers those loads all the same:
@@ -128,7 +140,7 @@ private:
       }
     }
     if (bytesPerSlot == 0)
-      return loadLatency;
+      return {loadLatency, 0, 0};
 
     // local_allocs live during the loop (defined inside, or defined outside
     // with users inside) occupy shared memory concurrently with the pipeline
@@ -143,7 +155,7 @@ private:
     // hand-written IR fragments in tests. Without a scope there is nothing to
     // measure, and guessing a budget would be worse than not clamping.
     if (!scope)
-      return loadLatency;
+      return {loadLatency, bytesPerSlot, 0};
     scope->walk([&](ttg::LocalAllocOp alloc) {
       if (alloc.getSrc())
         if (Operation *def = alloc.getSrc().getDefiningOp())
@@ -238,7 +250,67 @@ private:
              "stage. num_stages has no effect here. Both figures are "
              "estimates made before shared memory is allocated, so the real "
              "footprint may differ.";
-    return clamped;
+    return {clamped, bytesPerSlot, staticBytes};
+  }
+
+  // The clamp rewrites the depth the caller asked for, and until now the result
+  // was invisible outside an assertions build: the LDBG above needs
+  // LLVM_DEBUG, and `metadata.shared` is not evidence -- at 128x128x32 fp16,
+  // num_stages 1, 2 and 3 all report 32768 B while actually getting 0, 1 and 2
+  // slots. Publish the real number, as an opt-in dump for whoever is tuning and
+  // as a module attribute the backend turns into kernel metadata.
+  void reportPipelineDepth(const ClampResult &r, unsigned requested) {
+    if (auto mod = forOp->getParentOfType<ModuleOp>()) {
+      auto put = [&](StringRef name, unsigned v) {
+        unsigned prev = 0;
+        if (auto attr = mod->getAttrOfType<IntegerAttr>(name))
+          prev = attr.getInt();
+        mod->setAttr(name, IntegerAttr::get(
+                               IntegerType::get(mod.getContext(), 32),
+                               std::max(prev, v)));
+      };
+      put("ttg.sm75_pipeline_slots", r.latency);
+      put("ttg.sm75_pipeline_slots_requested", requested);
+    }
+
+    if (!::getenv("TRITON_SM75_DUMP_PIPELINE_DEPTH"))
+      return;
+
+    std::string name = "<kernel>";
+    if (auto fn = forOp->getParentOfType<FunctionOpInterface>())
+      name = fn.getName().str();
+    // Peel the NameLoc chain Triton wraps around the FileLineColLoc; printing
+    // the raw location gives loc("acc"("bp"("ap"(file:12:5)))), which is the
+    // names of the values feeding the loop, not something a reader wants.
+    Location loc = forOp.getLoc();
+    while (auto named = dyn_cast<NameLoc>(loc))
+      loc = named.getChildLoc();
+    std::string where;
+    if (auto fl = dyn_cast<FileLineColLoc>(loc))
+      where = (fl.getFilename().str() + ":" + std::to_string(fl.getLine()));
+    else {
+      llvm::raw_string_ostream os(where);
+      loc.print(os);
+    }
+    llvm::errs() << "sm75 pipeline: " << name << " at " << where
+                 << "\n  num_stages=" << numStages << " -> ";
+    if (r.latency == 0) {
+      llvm::errs() << "not pipelined; one slot needs " << r.bytesPerSlot
+                   << " B, " << (kSm75SharedMemoryBudget - r.staticBytes)
+                   << " B available\n";
+      return;
+    }
+    llvm::errs() << "prefetching " << r.latency << " iteration"
+                 << (r.latency == 1 ? "" : "s") << " ahead, " << r.latency
+                 << " shared slot" << (r.latency == 1 ? "" : "s") << " ("
+                 << (r.bytesPerSlot * r.latency) << " B)";
+    if (r.latency != requested)
+      llvm::errs() << "  [CLAMPED from " << requested << "; that would need "
+                   << (r.bytesPerSlot * requested) << " B, over the "
+                   << (kSm75SharedMemoryBudget - r.staticBytes)
+                   << " B available]\n  identical codegen to num_stages="
+                   << (r.latency + 1);
+    llvm::errs() << "\n";
   }
 
   // Mirrors how Allocation.cpp sizes a shared buffer (the padded vs
