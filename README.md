@@ -75,8 +75,9 @@ the path "Not implemented"). Triton INT8 also clears cuBLAS INT8 by ~1.8×.
 
 ![FP16 GEMM](.github/assets/benchmarks/fp16-gemm.png)
 
-For plain FP16 GEMM the Triton kernel reaches **≈ 84–86 % of cuBLAS** — NVIDIA's
-hand-tuned vendor library — across the mid-to-large size range.
+For plain FP16 GEMM the Triton kernel reaches **≈ 87–89 % of cuBLAS** — NVIDIA's
+hand-tuned vendor library — across the mid-to-large size range (three passes,
+`benchmarks/gemm/21`; the figure shows the middle one).
 
 Grouped (MoE) GEMM runs **+5–10 %** faster than the upstream configuration,
 almost all of it from using two pipeline stages instead of three: the third
@@ -112,25 +113,22 @@ own outputs before enabling it.
 
 The sm75 software pipeline (the first ever implemented for Turing) helps
 **latency-exposed** kernels — FlashAttention (**+48 % fwd / +11 % bwd on head_dim=128**,
-**+11 % fwd on head_dim=64**) and grouped/MoE GEMM (**+20 %**) — but not dense
-GEMM. That is not because its Tensor Cores are saturated: at `num_stages=1`
-dense GEMM is itself latency-exposed, stalling on memory far more than cuBLAS
-does. Pipelining does relieve that — it just costs more than it saves (below).
-Kernels with no reduction loop to pipeline (layernorm, softmax, elementwise) are
-not applicable.
+**+11 % fwd on head_dim=64**) and grouped/MoE GEMM (**+20 %**). Kernels with no
+reduction loop to pipeline (layernorm, softmax, elementwise) are not applicable.
 
 Pipeline depth (`num_stages`) is configurable — not limited to double-buffering —
 and autotuned per kernel and size. Turing's small 64 KB/CTA shared memory caps the
-useful depth: for the kernels that benefit from pipelining, **`num_stages=2` is the
-sweet spot**, because a third stage usually exceeds the budget (it OOMs for
-FlashAttention). Dense GEMM is the exception — fastest with no pipelining
-(`num_stages=1`), a third stage edging ~1 % ahead only at the largest 4096³ size.
-The cause is the register file, not saturation: a 128×128 tile over 4 warps
-spends 128 of Turing's 255 registers per thread on the f32 accumulator alone, so
-enabling the pipeline pushes it past the ceiling and the global-load pointers
-spill — reloaded seven times per iteration.
+useful depth. With two or more shared-memory slots (`num_stages` ≥ 3) the loop runs
+the classic double-buffer schedule: **one `bar.sync` per K-tile**, placed just before
+the refill of the slot the next-but-one iteration reads, and the K-loop `tl.dot` is
+split so `ldmatrix` for the next slice interleaves with the current `mma` instead of
+bursting at the loop head. That schedule took a cuBLAS-shaped 128×256 GEMM tile from
+1.7× slower than cuBLAS to **85 % of it**, and made it the fastest dense-GEMM config
+from 2048³ up; a single slot (`num_stages=2`) still needs two barriers per K-tile
+and remains the sweet spot where the third stage does not fit (FlashAttention
+forward on head_dim=128).
 
-Because that cap is applied silently, the depth you ask for is often not the
+Because the 64 KB cap is applied silently, the depth you ask for is often not the
 depth you get. On a 128×128×64 tile, `num_stages` 3 and 4 compile to the same
 kernel — 4 asks for 3 slots at 98304 B, over the 64 KB limit, and gets clamped
 back to 2 — so any difference you measure between them is noise. Two ways to
