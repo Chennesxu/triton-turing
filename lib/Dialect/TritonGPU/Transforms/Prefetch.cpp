@@ -96,6 +96,8 @@ class Prefetcher {
                             unsigned kWidth) const;
 
   bool isLoopCarriedValue(Value v);
+  bool isMultiSlotView(Value v);
+  bool barrierBetweenDotAndStore(triton::DotOp dot);
   Value getIncomingValue(Value v);
   Value getYieldValue(Value v);
   bool isPromotableValue(Value v);
@@ -210,6 +212,34 @@ bool Prefetcher::isLoopCarriedValue(Value v) {
   auto arg = dyn_cast_if_present<BlockArgument>(v);
   return arg && arg.getOwner() == forOp.getBody() &&
          arg.getArgNumber() >= forOp.getNumInductionVars();
+}
+
+// A memdesc_index view into a ring buffer with at least two slots.
+bool Prefetcher::isMultiSlotView(Value v) {
+  auto idx = v.getDefiningOp<triton::gpu::MemDescIndexOp>();
+  if (!idx)
+    return false;
+  auto shape = cast<triton::gpu::MemDescType>(idx.getSrc().getType()).getShape();
+  return shape.size() > 0 && shape[0] >= 2;
+}
+
+// True if, in loop body order, a ttg.barrier follows the dot and precedes the
+// first local_store (the sm75 sync-copy layout with the fence before the
+// producer side). Without it the remainder loads inserted before the dot
+// could race with the refill of their slot.
+bool Prefetcher::barrierBetweenDotAndStore(triton::DotOp dot) {
+  bool afterDot = false;
+  for (Operation &op : forOp.getBody()->without_terminator()) {
+    if (&op == dot.getOperation()) {
+      afterDot = true;
+      continue;
+    }
+    if (isa<triton::gpu::LocalStoreOp>(op))
+      return false;
+    if (afterDot && isa<triton::gpu::BarrierOp>(op))
+      return true;
+  }
+  return false;
 }
 
 Value Prefetcher::getIncomingValue(Value v) {
@@ -504,10 +534,25 @@ LogicalResult Prefetcher::initialize() {
       Value aHeaderDef = getIncomingValue(aSmem);
       Value bHeaderDef = getIncomingValue(bSmem);
       bool hasLoopCarriedSrc = aHeaderDef && bHeaderDef;
+      // sm75 synchronous copies carry no async tokens. Splitting the dot is
+      // still legal there when (a) the operands come from multi-slot ring
+      // buffers, so the head of the next tile never aliases the slot this
+      // iteration overwrites, and (b) the CTA barrier that fences the
+      // local_stores sits between the dot and the first local_store (the
+      // placement LowerLoops::placeSyncBarriers uses for >= 2 slots): the
+      // remainder loads are issued right before the dot, i.e. before that
+      // barrier, and the next-tile head loads land after it. Single-slot
+      // loops keep two barriers with the first one ahead of the dot and are
+      // rejected here.
+      bool syncRing = computeCapability == 75 && isMultiSlotView(aSmem) &&
+                      isMultiSlotView(bSmem) && barrierBetweenDotAndStore(dot);
       bool canPromoteSplitDot =
-          (dot2aToken[dot] || dot2bToken[dot]) && isPromotableValue(aSmem) &&
-          isPromotableValue(bSmem) && isPromotableValue(dot2aToken[dot]) &&
+          (dot2aToken[dot] || dot2bToken[dot] || syncRing) &&
+          isPromotableValue(aSmem) && isPromotableValue(bSmem) &&
+          isPromotableValue(dot2aToken[dot]) &&
           isPromotableValue(dot2bToken[dot]);
+      if (computeCapability == 75 && !syncRing)
+        continue;
       if (hasLoopCarriedSrc || canPromoteSplitDot) {
         dots.insert(dot);
       }

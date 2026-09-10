@@ -138,6 +138,7 @@ class CUDAOptions:
     instrumentation_mode: str = ""
     # sm75 only: run bf16 dots on the fp16 tensor core (see knobs.nvidia)
     sm75_bf16_dot_as_f16: bool = False
+    sm75_prefetch: bool = False
 
     def __post_init__(self):
         default_libdir = Path(__file__).parent / 'lib'
@@ -216,6 +217,8 @@ class CUDABackend(BaseBackend):
 
         if "sm75_bf16_dot_as_f16" not in args:
             args["sm75_bf16_dot_as_f16"] = capability == 75 and knobs.nvidia.sm75_bf16_dot_as_f16
+        if "sm75_prefetch" not in args:
+            args["sm75_prefetch"] = capability == 75 and knobs.nvidia.sm75_prefetch
 
         args["max_num_imprecise_acc_default"] = 2**30 if capability == 90 else 0
 
@@ -327,7 +330,7 @@ class CUDABackend(BaseBackend):
             passes.ttir.add_triton_licm(pm)
         passes.common.add_canonicalizer(pm)
         passes.ttir.add_loop_aware_cse(pm)
-        if capability // 10 == 8:
+        if capability // 10 == 8 or (capability == 75 and opt.sm75_prefetch):
             passes.ttgpuir.add_prefetch(pm)
         passes.ttgpuir.add_optimize_dot_operands(pm, capability >= 75)
         passes.ttgpuir.add_coalesce_async_copy(pm)
