@@ -190,19 +190,41 @@ void createSyncCopy(scf::ForOp forOp, tt::LoadOp loadOp, Value alloc,
 //
 //   INV-WAR: between a read of a buffer slot and the local_store that next
 //   overwrites it there must be at least one CTA barrier, so producers never
-//   clobber a tile other warps are still reading. With double buffering the
-//   overwrite of the slot read by iteration i happens in iteration i itself,
-//   so the barrier after the reads is load-bearing even within one iteration.
+//   clobber a tile other warps are still reading.
 //
 // bar.sync is a CTA-wide fence over all of shared memory, not a per-buffer
-// lock: one barrier after the last write of a producer group orders all of
-// the group's writes against all later reads, and one barrier after the last
-// read of a consumer group orders all reads against all later writes. One
-// barrier per (stage, cluster) group is therefore sufficient, instead of two
-// per load: for a GEMM with A and B loads this means 2 barriers per
-// iteration instead of 4. The PipelineExpander stamps the same loop body
-// into the prologue, so the producer barrier also fences the prefill stores
-// against the first kernel iteration's reads.
+// lock, so one barrier orders every read before it against every write after
+// it, for all buffers at once.
+//
+// The loop groups created by lowerLoops allocate as many slots as the stage
+// distance between the load and its first use (B == D). Iteration i therefore
+// reads slot i % B (tile i) and, later in the same iteration, overwrites that
+// very slot with tile i + B; the schedule places all reads before all writes
+// or the read would observe the new tile.
+//
+//   B >= 2: ONE barrier per iteration, placed right before the first write
+//   (after all reads and after the producer's global loads), satisfies both
+//   invariants. INV-WAR within iteration i is
+//   direct (read(i) < bar_i < write(i)). INV-RAW holds because the tile
+//   written in iteration i is first read in iteration i + B >= i + 2, and the
+//   barrier of iteration i + 1 sits in between. The barrier is scheduled in
+//   the producer stage (0) so the PipelineExpander also stamps it into every
+//   prologue copy: the prefill store of tile k is then fenced from its first
+//   read (loop iteration k) by the barriers of the later prologue copies and
+//   of the first loop iterations. The epilogue is not peeled on sm75 (loads
+//   are predicated off instead), so the barrier keeps executing there as well.
+//   This is the classic hand-written double buffering: one bar.sync per
+//   k-tile, and the producer side of iteration i overlaps with the consumer
+//   side of iteration i + 1 across the back-edge.
+//
+//   B == 1: the slot is refilled every iteration, so INV-RAW additionally
+//   needs a barrier between write(i) and read(i + 1): two barriers per
+//   iteration, one after the last write and one after the last read of each
+//   (stage, cluster) group.
+//
+// Both variants emit one barrier per producer/consumer side rather than one
+// per load, so a GEMM-shaped loop with A and B loads sees 1 (or 2) barriers
+// per iteration, not 2 (or 4).
 void placeSyncBarriers(scf::ForOp forOp, CoarseSchedule &schedule,
                        const DenseSet<Value> &syncAllocs) {
   auto traceToBase = [](Value v) {
@@ -220,6 +242,7 @@ void placeSyncBarriers(scf::ForOp forOp, CoarseSchedule &schedule,
     std::pair<int, CoarseSchedule::Cluster> stageCluster;
   };
   llvm::MapVector<std::pair<int, int>, GroupInfo> groups;
+  SmallVector<Operation *> readOps, writeOps; // in loop body order
 
   for (Operation &op : forOp.getBody()->without_terminator()) {
     bool writes = false, reads = false;
@@ -243,13 +266,68 @@ void placeSyncBarriers(scf::ForOp forOp, CoarseSchedule &schedule,
     auto [stage, cluster] = it->second;
     GroupInfo &group = groups[{stage, *cluster}];
     group.stageCluster = it->second;
-    if (writes)
+    if (writes) {
       group.lastWrite = &op;
-    if (reads)
+      writeOps.push_back(&op);
+    }
+    if (reads) {
       group.lastRead = &op;
+      readOps.push_back(&op);
+    }
   }
 
   OpBuilderForStage builder(forOp.getLoc(), forOp, schedule);
+
+  // Single-barrier variant (B >= 2 for every buffer, reads scheduled strictly
+  // before writes). Order is decided by the cluster, not by the position in
+  // the not-yet-reordered loop body.
+  bool multiBuffered = llvm::all_of(syncAllocs, [](Value alloc) {
+    auto shape = cast<ttg::MemDescType>(alloc.getType()).getShape();
+    return shape.size() > 0 && shape[0] >= 2;
+  });
+  if (multiBuffered && !readOps.empty() && !writeOps.empty()) {
+    auto clusterOf = [&](Operation *op) { return *schedule[op].second; };
+    Operation *lastRead = readOps.front();
+    for (Operation *op : readOps)
+      if (clusterOf(op) >= clusterOf(lastRead))
+        lastRead = op; // later cluster, or same cluster and later in body
+    int firstWriteCluster = clusterOf(writeOps.front());
+    int producerStage = schedule[writeOps.front()].first;
+    for (Operation *op : writeOps) {
+      firstWriteCluster = std::min(firstWriteCluster, clusterOf(op));
+      producerStage = std::min(producerStage, schedule[op].first);
+    }
+    if (clusterOf(lastRead) < firstWriteCluster) {
+      // Tell the Membar analysis that these refills are ordered against the
+      // reads of the *next* iteration by that iteration's barrier (they use a
+      // different slot), otherwise it re-inserts a second barrier at the loop
+      // head and the whole point is lost.
+      for (Operation *op : writeOps)
+        op->setAttr(ttg::AttrSm75RingStoreName, builder.getUnitAttr());
+      // Fence right before the first local_store rather than right after the
+      // last read. Both satisfy INV-RAW/INV-WAR (every read precedes the
+      // barrier, every write follows it); this placement leaves the whole
+      // dot between the reads and the barrier, so ptxas can spread the
+      // ldmatrix over the mma stream, and it is what the prefetch pass
+      // requires (it issues the remainder K-slice loads right before the
+      // dot, i.e. still ahead of the barrier). The stores are sunk behind the
+      // last store so every global load of the producer side is issued before
+      // the barrier and no load latency is exposed behind it.
+      Operation *lastWrite = writeOps.back();
+      for (Operation *op : writeOps)
+        if (op != lastWrite)
+          op->moveBefore(lastWrite);
+      Operation *firstWrite = writeOps.front();
+      builder.setStageCluster({producerStage, schedule[firstWrite].second});
+      builder.setInsertionPoint(firstWrite);
+      ttg::BarrierOp::create(builder, firstWrite->getLoc(),
+                             ttg::AddrSpace::Local);
+      return;
+    }
+  }
+
+  // Two-barrier variant: one after the last write and one after the last read
+  // of each (stage, cluster) group.
   for (auto &[key, group] : groups) {
     builder.setStageCluster(group.stageCluster);
     for (Operation *anchor : {group.lastWrite, group.lastRead}) {
