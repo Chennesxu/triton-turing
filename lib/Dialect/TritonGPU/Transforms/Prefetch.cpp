@@ -97,6 +97,7 @@ class Prefetcher {
 
   bool isLoopCarriedValue(Value v);
   bool isMultiSlotView(Value v);
+  bool sameElementWidth(Value smem, Value dotOperand);
   bool barrierBetweenDotAndStore(triton::DotOp dot);
   Value getIncomingValue(Value v);
   Value getYieldValue(Value v);
@@ -221,6 +222,24 @@ bool Prefetcher::isMultiSlotView(Value v) {
     return false;
   auto shape = cast<triton::gpu::MemDescType>(idx.getSrc().getType()).getShape();
   return shape.size() > 0 && shape[0] >= 2;
+}
+
+// The prefetch subslice is sized in dot-operand elements, so it may only be
+// applied to a buffer whose elements are the same width. The sm75 int4 path
+// packs eight i4 into one i32 in shared memory and reinterprets at the
+// register level, so its memdesc is 8x narrower than the dot operand type;
+// slicing it with an i4 width runs off the end of the allocation and the
+// MemDescSubsliceOp verifier rejects it.
+bool Prefetcher::sameElementWidth(Value smem, Value dotOperand) {
+  auto memTy = dyn_cast<triton::gpu::MemDescType>(smem.getType());
+  auto tensorTy = dyn_cast<RankedTensorType>(dotOperand.getType());
+  if (!memTy || !tensorTy)
+    return false;
+  Type memElem = memTy.getElementType();
+  Type dotElem = tensorTy.getElementType();
+  if (!memElem.isIntOrFloat() || !dotElem.isIntOrFloat())
+    return false;
+  return memElem.getIntOrFloatBitWidth() == dotElem.getIntOrFloatBitWidth();
 }
 
 // True if, in loop body order, a ttg.barrier follows the dot and precedes the
@@ -545,7 +564,10 @@ LogicalResult Prefetcher::initialize() {
       // loops keep two barriers with the first one ahead of the dot and are
       // rejected here.
       bool syncRing = computeCapability == 75 && isMultiSlotView(aSmem) &&
-                      isMultiSlotView(bSmem) && barrierBetweenDotAndStore(dot);
+                      isMultiSlotView(bSmem) &&
+                      sameElementWidth(aSmem, dot.getA()) &&
+                      sameElementWidth(bSmem, dot.getB()) &&
+                      barrierBetweenDotAndStore(dot);
       bool canPromoteSplitDot =
           (dot2aToken[dot] || dot2bToken[dot] || syncRing) &&
           isPromotableValue(aSmem) && isPromotableValue(bSmem) &&
