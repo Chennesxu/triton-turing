@@ -308,6 +308,31 @@ bool NVIDIA::canSkipBarSync(Operation *before, Operation *after,
       isa<ttng::WaitBarrierOp>(after))
     return true;
 
+  // sm75 synchronous-copy ring buffers (>= 2 slots, one barrier per loop
+  // iteration, see LowerLoops::placeSyncBarriers): the refill of slot i in
+  // iteration i and the read of slot i+1 at the head of iteration i+1 touch
+  // different slots, and the tile written in iteration i is first read in
+  // iteration i+2, behind the barrier of iteration i+1. Consecutive refills
+  // likewise rotate slots. Without this the analysis, which cannot see the
+  // slot index, would put a second barrier at the loop head. Buffer identity
+  // goes through the allocation's alias sets because the loop runs in CFG
+  // form here and the prefetch pass threads slot views through block args.
+  if (auto store = dyn_cast<triton::gpu::LocalStoreOp>(before);
+      store && store->hasAttr(triton::gpu::AttrSm75RingStoreName)) {
+    auto ringIds = allocation->getAllBufferIdsWithAliases(store.getDst());
+    auto onlyRing = [&](Value v) {
+      auto ids = allocation->getAllBufferIdsWithAliases(v);
+      return !ids.empty() && llvm::all_of(ids, [&](Allocation::BufferId id) {
+        return ringIds.count(id);
+      });
+    };
+    if (auto load = dyn_cast<triton::gpu::LocalLoadOp>(after))
+      return onlyRing(load.getSrc());
+    if (auto other = dyn_cast<triton::gpu::LocalStoreOp>(after))
+      return other->hasAttr(triton::gpu::AttrSm75RingStoreName) &&
+             onlyRing(other.getDst());
+  }
+
   return false;
 }
 

@@ -50,6 +50,12 @@ constexpr static char AttrMaxRegistersName[] = "ttg.maxnreg";
 constexpr static char AttrNumWarpsName[] = "ttg.num-warps";
 constexpr static char AttrNumCTAsName[] = "ttg.num-ctas";
 constexpr static char AttrTargetName[] = "ttg.target";
+// Marks a local_store that refills a slot of an sm75 synchronous-copy ring
+// buffer (>= 2 slots) fenced by the single per-iteration barrier placed in
+// LowerLoops::placeSyncBarriers. The NVIDIA Membar filter uses it to skip the
+// store -> next-iteration-load pair that the barrier of the following
+// iteration already orders (the two touch different slots).
+constexpr static char AttrSm75RingStoreName[] = "ttg.sm75_ring_store";
 constexpr static char AttrNumThreadsPerWarp[] = "ttg.threads-per-warp";
 
 // Find the contextual number of warps on which this operation is executed.

@@ -6,6 +6,12 @@
 // bar.sync must execute uniformly across the CTA: wrapping it in control flow
 // would deadlock, and predicateOp would abort compilation if it did not
 // whitelist BarrierOp.
+//
+// With two slots there is a single barrier per iteration, right before the
+// store. It is scheduled in the producer stage, so every prologue copy
+// carries one too (load, barrier, store): the prefill of tile k is fenced
+// from its first read in loop iteration k by the barriers of the later
+// prologue copies and of the earlier loop iterations.
 
 #A = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
 
@@ -13,33 +19,34 @@ module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32, ttg.targ
 // CHECK-LABEL: @sync_copy_expand
 // CHECK: %[[ALLOC:.*]] = ttg.local_alloc : () -> !ttg.memdesc<2x128x32
 
-// Prologue: two prefill iterations, each load masked by a trip-count guard.
+// Prologue: two prefill copies, each load masked by a trip-count guard, each
+// copy carrying the (producer-stage) barrier right before its store.
 // CHECK: tt.load %{{.*}}, %{{.*}} : tensor<128x32x!tt.ptr<f16>
-// CHECK: ttg.local_store
 // CHECK: ttg.barrier local
+// CHECK-NEXT: ttg.local_store
 // CHECK: tt.load %{{.*}}, %{{.*}} : tensor<128x32x!tt.ptr<f16>
-// CHECK: ttg.local_store
 // CHECK: ttg.barrier local
+// CHECK-NEXT: ttg.local_store
+// CHECK-NOT: ttg.barrier
 
-// Kernel: consumer side first (local_load + barrier), then the next tile's
-// masked load and store. No op may be wrapped in control flow, and no
-// unresolved ttg.mask may survive.
+// Kernel: consumer side first (local_load, use), then the next tile's masked
+// load, the one barrier, and the store. No op may be wrapped in control flow,
+// and no unresolved ttg.mask may survive.
 // CHECK: scf.for
 // CHECK-NOT: scf.if
-// CHECK-NOT: ttg.mask
+// CHECK-NOT: ttg.barrier
 // CHECK:   %[[VAL:.*]] = ttg.local_load
 // CHECK-NOT: scf.if
-// CHECK:   ttg.barrier local
-// CHECK-NOT: scf.if
+// CHECK-NOT: ttg.barrier
 // CHECK:   "use"(%[[VAL]])
 // CHECK-NOT: scf.if
 // CHECK:   tt.load %{{.*}}, %{{.*}} : tensor<128x32x!tt.ptr<f16>
 // CHECK-NOT: scf.if
-// CHECK:   ttg.local_store
-// CHECK-NOT: scf.if
 // CHECK:   ttg.barrier local
+// CHECK-NEXT: ttg.local_store
 // CHECK-NOT: scf.if
 // CHECK-NOT: ttg.mask
+// CHECK-NOT: ttg.barrier
 // CHECK:   scf.yield
 // CHECK: ttg.local_dealloc %[[ALLOC]]
 tt.func @sync_copy_expand(%lb : index, %ub : index, %step : index,
