@@ -55,9 +55,19 @@ def get_turing_grouped_config():
     #
     # The default list sets no num_stages at all, so every entry runs at
     # triton.Config's default of 3. On a 128x128x32 tile that is 49152 B of
-    # shared memory -- over the 32 KB that lets two CTAs share an SM. The
-    # pipeline buys back less than the occupancy it costs, and one or two
-    # stages fit in 32768 B and win.
+    # shared memory, over the 32 KB that lets two CTAs share an SM.
+    #
+    # Three stages used to lose on that alone, and no longer does: with two or
+    # more ring slots a k-tile costs one bar.sync instead of two. The win is
+    # confined to one CTA per SM, where s3 beats s2 by 7% at N=512, 16% at
+    # 1024 and 13% at 2048 (7 rotated cycles, benchmarks/grouped-gemm/02). At
+    # two CTAs per SM it is a tie within 1.6%, and the autotuner picks two CTAs
+    # per SM for every shape this tutorial benchmarks, so end to end the entry
+    # is worth nothing here (-1.4% to +0.8% over five alternated runs,
+    # benchmarks/grouped-gemm/03). It is kept for the shapes with too few
+    # tiles to fill two waves, the same reason the 72-CTA entries exist. Being
+    # never worse is the bar it has to clear, because the autotune key below
+    # makes one pick serve every later shape.
     #
     # NUM_SM matters too, but the default list mostly gets it right by
     # accident. It is not the SM count: it is how many CTAs the persistent
@@ -97,6 +107,7 @@ def get_turing_grouped_config():
     sizes = [
         {'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'num_stages': 1, 'num_warps': 4},
         {'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'num_stages': 2, 'num_warps': 4},
+        {'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'num_stages': 3, 'num_warps': 4},
     ]
     # One CTA per SM stays in the list for problems with too few tiles to fill
     # two waves; the sweep never picked it above N=512.
