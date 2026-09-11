@@ -4,13 +4,13 @@
 
 **Triton-Turing** is a community-maintained fork of [Triton](https://github.com/triton-lang/triton) focused on restoring high-performance Tensor Core support for NVIDIA Turing GPUs (SM75: RTX 2080 Ti, Titan RTX).
 
-Upstream Triton supports Turing's MMA instructions, but critical optimizations were gated to SM80+ (Ampere and later) — most importantly the software pipeline, which exclusively uses `cp.async`, an Ampere-only instruction. As a result, Turing performance degrades significantly compared to its tensor-core potential.
+Upstream Triton supports Turing's MMA instructions, but critical optimizations were gated to SM80+ (Ampere and later). The biggest one is the software pipeline, which exclusively uses `cp.async`, an Ampere-only instruction. As a result, Turing performance degrades significantly compared to its tensor-core potential.
 
 ## Goals
 
-1. **Software pipelining without `cp.async`** — a multi-stage `ld.global → st.shared → bar.sync` path to overlap memory loads with MMA on Turing (`num_stages` ≥ 2, not just double-buffering)
-2. **Turing-specific autotune** — configs tuned for 64 KB/CTA shared memory and native instruction shapes (fp16: `m16n8k8`, int8: `m8n8k16`)
-3. **int4 MMA support** — implement the `m8n8k32` instruction path for int4 precision (hardware-supported but not implemented in upstream Triton)
+1. **Software pipelining without `cp.async`**: a multi-stage `ld.global → st.shared → bar.sync` path to overlap memory loads with MMA on Turing (`num_stages` ≥ 2, not just double-buffering)
+2. **Turing-specific autotune**: configs tuned for 64 KB/CTA shared memory and native instruction shapes (fp16: `m16n8k8`, int8: `m8n8k16`)
+3. **int4 MMA support**: implement the `m8n8k32` instruction path for int4 precision (hardware-supported but not implemented in upstream Triton)
 
 ## Status
 
@@ -20,7 +20,6 @@ Upstream Triton supports Turing's MMA instructions, but critical optimizations w
 | Turing-specific autotune configs | ✅ Done |
 | int8 GEMM (`m8n8k16`) | ✅ Done |
 | int4 MMA (`m8n8k32`) — first usable pure-int4 matmul in Triton | ✅ Done |
-| FlashAttention-2 forward + backward (pipelined) | ✅ Done |
 | bf16 dot on the fp16 Tensor Core — opt-in, see below | ✅ Done |
 
 ## Performance
@@ -35,10 +34,10 @@ are still throttle-prone.
 ![FlashAttention-2 forward](.github/assets/benchmarks/fa2-forward.png)
 
 The Triton FA2 forward kernel (tutorial `06-fused-attention.py` plus our sm75
-pipeline) is the fastest at every size measured — ahead of a from-scratch
+pipeline) is the fastest at every size measured. It is ahead of a from-scratch
 CUDA/CUTLASS FlashAttention for Turing by **+21–26%** at head dim 64 and
-**+4–8%** at head dim 128, and ahead of PyTorch SDPA (xformers backend) by
-**1.7–2.2×**. Attention benefits from the pipeline because the softmax
+**+8–10%** at head dim 128, and ahead of PyTorch SDPA (xformers backend) by
+**1.8–2.1×**. Attention benefits from the pipeline because the softmax
 dependency chain leaves the Tensor Cores idle, and the pipeline uses that window
 to prefetch K/V.
 
@@ -46,43 +45,37 @@ to prefetch K/V.
 
 ![FlashAttention-2 backward](.github/assets/benchmarks/fa2-backward.png)
 
-Backward is honest about a limitation. At head dim 64 our kernel beats the
-CUDA/CUTLASS implementation by **+35–41%**, from Turing-specific block sizes
-plus a codegen change that lets a transposed dot operand read the shared buffer
-its untransposed sibling already filled, instead of paying a scratch round trip
-every loop iteration.
+At head dim 64 our kernel beats the CUDA/CUTLASS implementation by **+35–40%**,
+from Turing-specific block sizes plus a codegen change that lets a transposed
+dot operand read the shared buffer its untransposed sibling already filled,
+instead of paying a scratch round trip every loop iteration.
 
-At head dim 128 it **trails by 13–16%** — the only place we lose. Upstream's
+At head dim 128 it **trails by 15–16%**, the only place we lose. Upstream's
 d=128 backward blocks need ~82 KB of shared memory, well past Turing's hard
 **64 KB/CTA** limit, so `BLOCK_N1` and `BLOCK_M2` are halved to 64 to fit. An
 exhaustive sweep of the 216-configuration block/stage/warp space confirms that
 fallback is the fastest option available, not a tuning oversight: every larger
 tile that fits forces `num_stages=1`, and losing the pipeline costs more than
-the tile gains. Closing the gap needs a different kernel structure, and that is
-future work.
+the tile gains.
 
 ### Integer GEMM — INT4 doubles INT8, and cuBLAS has no INT4 path
 
 ![Integer GEMM](.github/assets/benchmarks/integer-gemm.png)
 
-INT4 (`m8n8k32`) reaches **≈ 2× the throughput of INT8** (peak **219 TOPS**),
-gaining on both fronts: 2× Tensor Core compute and half the shared-memory
-traffic (operands stay packed as `int32`). cuBLAS exposes **no INT4 GEMM at all**
-on Turing — this is the first usable pure-int4 matmul in Triton (upstream marks
-the path "Not implemented"). Triton INT8 also clears cuBLAS INT8 by ~1.8×.
+INT4 (`m8n8k32`) runs **2.1–2.5× faster than INT8** over the mid-to-large
+range and peaks at **258 TOPS**. It gets both 2× the Tensor Core throughput and
+half the shared-memory traffic, since operands stay packed as `int32`. cuBLAS
+has **no INT4 GEMM at all** on Turing, so this is the first usable pure-int4
+matmul in Triton; upstream marks the path "Not implemented". Triton INT8 is
+**~2.1× faster than cuBLAS INT8**.
 
 ### FP16 GEMM — matching NVIDIA's hand-tuned cuBLAS
 
 ![FP16 GEMM](.github/assets/benchmarks/fp16-gemm.png)
 
-For plain FP16 GEMM the Triton kernel reaches **≈ 87–89 % of cuBLAS** — NVIDIA's
-hand-tuned vendor library — across the mid-to-large size range (three passes,
+For plain FP16 GEMM the Triton kernel reaches **≈ 87–89 % of cuBLAS**, NVIDIA's
+hand-tuned vendor library, across the mid-to-large size range (three passes,
 `benchmarks/gemm/21`; the figure shows the middle one).
-
-Grouped (MoE) GEMM runs **+5–10 %** faster than the upstream configuration,
-almost all of it from using two pipeline stages instead of three: the third
-stage pushes a 128×128×32 tile past the 32 KB that lets two CTAs share a Turing
-SM, and buys back less than the occupancy it costs.
 
 ### bf16 — an opt-in Tensor Core path
 
@@ -100,38 +93,36 @@ checkpoints, so a large share of real workloads never touch the Tensor Cores.
 | 4096³ | 63.481 ms | 4.828 ms | **13.1×** |
 
 It is **off by default because it changes numerics.** bf16's 8 mantissa bits fit
-fp16 exactly, so operands inside fp16's normal range — 6.1e-5 to 65504 — convert
+fp16 exactly, so operands inside fp16's normal range, 6.1e-5 to 65504, convert
 losslessly. Outside it both ends degrade: smaller values fall into fp16
 subnormals and lose precision (relative error reaches 2.5e-2 at magnitude 1e-6),
 larger ones become `inf`. A model that uses bf16 *because* fp16 overflows is
-exactly what this breaks, and upstream's dot tests pass either way — check your
+exactly what this breaks, and upstream's dot tests pass either way. Check your
 own outputs before enabling it.
 
 ### When the software pipeline helps
 
 ![Pipeline regime](.github/assets/benchmarks/pipeline-regime.png)
 
-The sm75 software pipeline (the first ever implemented for Turing) helps
-**latency-exposed** kernels — FlashAttention (**+48 % fwd / +11 % bwd on head_dim=128**,
-**+11 % fwd on head_dim=64**) and grouped/MoE GEMM (**+20 %**). Kernels with no
-reduction loop to pipeline (layernorm, softmax, elementwise) are not applicable.
+This is the first software pipeline implemented for Turing. It helps kernels
+that stall on memory: FlashAttention forward gains **25 %** at head_dim=128 and
+**8 %** at 64, grouped/MoE GEMM **22 %**. It makes FlashAttention backward at
+head_dim=64 **9 % slower**. Layernorm, softmax and elementwise have no reduction
+loop, so it does not apply to them.
 
-Pipeline depth (`num_stages`) is configurable — not limited to double-buffering —
-and autotuned per kernel and size. Turing's small 64 KB/CTA shared memory caps the
-useful depth. With two or more shared-memory slots (`num_stages` ≥ 3) the loop runs
-the classic double-buffer schedule: **one `bar.sync` per K-tile**, placed just before
-the refill of the slot the next-but-one iteration reads, and the K-loop `tl.dot` is
-split so `ldmatrix` for the next slice interleaves with the current `mma` instead of
-bursting at the loop head. That schedule took a cuBLAS-shaped 128×256 GEMM tile from
-1.7× slower than cuBLAS to **85 % of it**, and made it the fastest dense-GEMM config
-from 2048³ up; a single slot (`num_stages=2`) still needs two barriers per K-tile
-and remains the sweet spot where the third stage does not fit (FlashAttention
-forward on head_dim=128).
+`num_stages` is autotuned per kernel and size, and the 64 KB/CTA shared memory
+limits how deep it can go. With two or more slots (`num_stages` ≥ 3) each K-tile
+costs one `bar.sync`, and `tl.dot` is split so `ldmatrix` runs between `mma`
+instructions instead of bursting at the loop head. On a 128×256 tile that moved
+us from 1.7× slower than cuBLAS to **85 % of it**, and it is now the fastest
+dense-GEMM config from 2048³ up. With one slot (`num_stages=2`) each K-tile
+costs two barriers, which is still faster when a third slot would cost more than
+it returns: on FlashAttention forward at head_dim=64 it halves occupancy.
 
 Because the 64 KB cap is applied silently, the depth you ask for is often not the
 depth you get. On a 128×128×64 tile, `num_stages` 3 and 4 compile to the same
-kernel — 4 asks for 3 slots at 98304 B, over the 64 KB limit, and gets clamped
-back to 2 — so any difference you measure between them is noise. Two ways to
+kernel: 4 asks for 3 slots at 98304 B, over the 64 KB limit, and gets clamped
+back to 2, so any difference you measure between them is noise. Two ways to
 see the real depth:
 
 ```shell
@@ -166,4 +157,4 @@ The repository also contains a separate `triton_kernels` package; if you need it
 **Windows:** the [`windows` branch](https://github.com/Chennesxu/triton-turing/tree/windows)
 carries the same sm75 work on top of
 [triton-windows](https://github.com/triton-lang/triton-windows) and builds with
-MSVC. Untested by us — we have no Turing card in a Windows machine.
+MSVC. Untested by us; we have no Turing card in a Windows machine.
