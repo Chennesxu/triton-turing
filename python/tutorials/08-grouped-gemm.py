@@ -58,16 +58,18 @@ def get_turing_grouped_config():
     # shared memory, over the 32 KB that lets two CTAs share an SM.
     #
     # Three stages used to lose on that alone, and no longer does: with two or
-    # more ring slots a k-tile costs one bar.sync instead of two. The win is
-    # confined to one CTA per SM, where s3 beats s2 by 7% at N=512, 16% at
-    # 1024 and 13% at 2048 (7 rotated cycles, benchmarks/grouped-gemm/02). At
-    # two CTAs per SM it is a tie within 1.6%, and the autotuner picks two CTAs
-    # per SM for every shape this tutorial benchmarks, so end to end the entry
-    # is worth nothing here (-1.4% to +0.8% over five alternated runs,
-    # benchmarks/grouped-gemm/03). It is kept for the shapes with too few
-    # tiles to fill two waves, the same reason the 72-CTA entries exist. Being
-    # never worse is the bar it has to clear, because the autotune key below
-    # makes one pick serve every later shape.
+    # more ring slots a k-tile costs one bar.sync instead of two. Pinning the
+    # config and rotating (benchmarks/grouped-gemm/02, 7 cycles, nothing
+    # silently clamped), s3 beats s2 by 7.4% at N=512, 16.5% at 1024 and 12.9%
+    # at 2048 with one CTA per SM, and by 7.6% / 1.6% / 0.9% with two.
+    #
+    # End to end the autotuner picks two CTAs per SM at every shape here, so
+    # what the entry is worth follows that second row: +6.8% at N=256, +6.5%
+    # at 512, +1.9% at 1024, +0.9% at 2048 (grouped-gemm/03, five alternated
+    # runs with and without it, median). The gain is in the small shapes; at
+    # 2048 it is noise. Time the kernel on prebuilt tensors when checking
+    # this -- group_gemm_fn rebuilds five device tensors per call and the host
+    # cost hides the difference entirely.
     #
     # NUM_SM matters too, but the default list mostly gets it right by
     # accident. It is not the SM count: it is how many CTAs the persistent
