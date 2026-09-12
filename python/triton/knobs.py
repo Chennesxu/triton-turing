@@ -526,6 +526,13 @@ class nvidia_knobs(base_knobs):
     # exponent range is much narrower: operands above 65504 become inf. Off by
     # default because that changes numerics silently.
     sm75_bf16_dot_as_f16: env_bool = env_bool("TRITON_SM75_BF16_DOT_AS_F16", False)
+    # Run the tritongpu-prefetch pass on sm75: the k-loop dot is split into
+    # 16-wide K-slices and the next tile's first slice is read from shared
+    # memory at the end of the iteration, so ldmatrix interleaves with mma
+    # instead of bursting at the loop head. Only applies to loops with >= 2
+    # buffer slots (num_stages >= 3). Set to 0 to compare against the
+    # unsplit loop.
+    sm75_prefetch: env_bool = env_bool("TRITON_SM75_PREFETCH", True)
 
 
 class amd_knobs(base_knobs):
