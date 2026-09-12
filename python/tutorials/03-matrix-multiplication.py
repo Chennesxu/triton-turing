@@ -222,16 +222,20 @@ def get_turing_autotune_config():
     # and stages shallow instead, and includes deep-K single-stage points
     # (the cudaTensorCoreGemm design: amortize barriers over a deep chunk).
     sizes = [
-        # large tiles. On large square GEMM the sync-copy pipeline is a net
-        # loss: the kernel is compute-bound (Tensor Core ~71% even at s1) and
-        # load latency is already hidden by ptxas register-level scheduling, so
-        # the single-buffer num_stages=1 point below wins (~+5% vs s3). The
-        # s2/s3 variants stay for smaller/latency-exposed shapes.
+        # large tiles. num_stages=1 (no pipeline) and num_stages=3 (two
+        # shared-memory slots, one bar.sync per k-tile, ldmatrix interleaved
+        # with mma by the prefetch pass) trade places with problem size on the
+        # 128x128 tile: s1 wins at 2048, s3 at 4096. num_stages=2 has a single
+        # slot, so it keeps two barriers per k-tile and never wins on large
+        # tiles; it stays for latency-exposed shapes. The 128x256 s3 w8 point
+        # (cuBLAS's own tile shape) is the fastest large-square config from
+        # 2048 up (benchmarks/gemm/20).
         {'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'num_stages': 1, 'num_warps': 4},
         {'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'num_stages': 2, 'num_warps': 4},
         {'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'num_stages': 3, 'num_warps': 4},
         {'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'num_stages': 2, 'num_warps': 8},
         {'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32, 'num_stages': 2, 'num_warps': 8},
+        {'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32, 'num_stages': 3, 'num_warps': 8},
         {'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'num_stages': 2, 'num_warps': 8},
         # deeper K, fewer stages
         {'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'num_stages': 1, 'num_warps': 4},
