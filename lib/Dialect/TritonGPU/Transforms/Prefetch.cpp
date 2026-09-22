@@ -230,6 +230,9 @@ bool Prefetcher::isMultiSlotView(Value v) {
 // register level, so its memdesc is 8x narrower than the dot operand type;
 // slicing it with an i4 width runs off the end of the allocation and the
 // MemDescSubsliceOp verifier rejects it.
+// Rescaling the subslice by that pack factor instead works, and is 27-38x
+// slower: the carried head slices spill, and the int4 autotuner never picks a
+// >= 2 slot config anyway. Measured in benchmarks/gemm/24.
 bool Prefetcher::sameElementWidth(Value smem, Value dotOperand) {
   auto memTy = dyn_cast<triton::gpu::MemDescType>(smem.getType());
   auto tensorTy = dyn_cast<RankedTensorType>(dotOperand.getType());
