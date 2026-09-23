@@ -67,15 +67,43 @@ static constexpr const char *FP4ToFP16Ptx =
     "cvt.rn.f16x2.e4m3x2 $3, t3;\n"
     "}";
 
+// Same conversion without cvt.rn.f16x2.e4m3x2, which needs sm_89: every e2m1
+// value has a zero low byte in fp16, so look up the high byte directly and
+// spread each one into the top of a 16-bit lane. Bit-exact with the sequence
+// above for all 16 codes, -0 included.
+static constexpr const char *FP4ToFP16NoCvtPtx =
+    "{\n"
+    ".reg .b32           a<11>;\n"
+    "and.b32             a0, $4, 0x77777777;\n\t"
+    "and.b32             a1, $4, 0x88888888;\n\t"
+    "shr.u32             a2, a1, 3;\n\t"
+    "shr.u32             a3, a0, 16;\n\t"
+    "shr.u32             a4, a2, 16;\n\t"
+    "prmt.b32            a5, 0x3E3C3800, 0x46444240, a0;\n"
+    "prmt.b32            a6, 0x3E3C3800, 0x46444240, a3;\n"
+    "prmt.b32            a7, 0x00008000, 0x0, a2;\n"
+    "prmt.b32            a8, 0x00008000, 0x0, a4;\n"
+    "or.b32              a9, a5, a7;\n\t"
+    "or.b32              a10, a6, a8;\n\t"
+    "prmt.b32            $0, a9, 0, 0x1404;\n"
+    "prmt.b32            $1, a9, 0, 0x3424;\n"
+    "prmt.b32            $2, a10, 0, 0x1404;\n"
+    "prmt.b32            $3, a10, 0, 0x3424;\n"
+    "}";
+
 static Value createInlineAsmUpcast(Location loc, RewriterBase &rewriter,
-                                   bool toFp16, Type retType, Value packedVec) {
+                                   bool toFp16, int computeCapability,
+                                   Type retType, Value packedVec) {
   PTXBuilder builder;
   SmallVector<PTXBuilder::Operand *> operands;
   for (int i = 0; i < 4; i++) {
     operands.push_back(builder.newOperand("=r"));
   }
   operands.push_back(builder.newOperand(packedVec, "r"));
-  auto &ptxOp = *builder.create(toFp16 ? FP4ToFP16Ptx : FP4ToBP16Ptx);
+  const char *ptx = !toFp16                 ? FP4ToBP16Ptx
+                    : computeCapability < 89 ? FP4ToFP16NoCvtPtx
+                                             : FP4ToFP16Ptx;
+  auto &ptxOp = *builder.create(ptx);
   ptxOp(operands, /*onlyAttachMLIRArgs=*/true);
   Value result = builder.launch(rewriter, loc, retType, false);
   return result;
@@ -84,8 +112,10 @@ static Value createInlineAsmUpcast(Location loc, RewriterBase &rewriter,
 namespace {
 class Fp4ToFpOpPattern : public ConvertOpToLLVMPattern<Fp4ToFpOp> {
 public:
-  Fp4ToFpOpPattern(LLVMTypeConverter &typeConverter, PatternBenefit benefit)
-      : ConvertOpToLLVMPattern<Fp4ToFpOp>(typeConverter, benefit) {}
+  Fp4ToFpOpPattern(LLVMTypeConverter &typeConverter, int computeCapability,
+                   PatternBenefit benefit)
+      : ConvertOpToLLVMPattern<Fp4ToFpOp>(typeConverter, benefit),
+        computeCapability(computeCapability) {}
 
   LogicalResult
   matchAndRewrite(Fp4ToFpOp op, OpAdaptor adaptor,
@@ -115,8 +145,8 @@ public:
       packedVec = b.insert_element(packedVec, v3, b.i32_val(3));
       SmallVector<Type> rets(4, i32_ty);
       Type retType = struct_ty(rets);
-      Value ret =
-          createInlineAsmUpcast(loc, rewriter, toFp16, retType, packedVec);
+      Value ret = createInlineAsmUpcast(loc, rewriter, toFp16,
+                                        computeCapability, retType, packedVec);
       for (int i = 0; i < 4; i++) {
         Value extractI32 = b.extract_val(ret, i);
         Value elements = b.bitcast(extractI32, vec_ty(elemType, 2));
@@ -130,11 +160,14 @@ public:
     rewriter.replaceOp(op, result);
     return success();
   }
+
+private:
+  int computeCapability;
 };
 } // anonymous namespace
 
 void mlir::triton::NVIDIA::populateFp4ToFpToLLVMPatterns(
     LLVMTypeConverter &typeConverter, RewritePatternSet &patterns,
-    PatternBenefit benefit) {
-  patterns.add<Fp4ToFpOpPattern>(typeConverter, benefit);
+    int computeCapability, PatternBenefit benefit) {
+  patterns.add<Fp4ToFpOpPattern>(typeConverter, computeCapability, benefit);
 }
