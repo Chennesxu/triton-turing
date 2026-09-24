@@ -28,8 +28,10 @@ Benchmarks and the reasoning behind each result are on the
 measured on Linux, on a Titan RTX** — nothing here has been benchmarked on
 Windows, and the numbers should not be read as Windows results.
 
-Turing has no bf16 Tensor Core, so a bf16 `tl.dot` falls back to CUDA-core FMA.
-`TRITON_SM75_BF16_DOT_AS_F16=1` converts the operands to fp16 and issues
+Turing has no bf16 Tensor Core, so a bf16 `tl.dot` falls back to CUDA-core FMA;
+compiling such a kernel raises a `UserWarning` that names it.
+`TRITON_SM75_BF16_DOT_AS_F16=1` (or `sm75_bf16_dot_as_f16=True` on a single
+launch) converts the operands to fp16 and issues
 `m16n8k8` instead — 12-18x faster on Linux, but **off by default because it
 changes numerics**: operands below 6.1e-5 lose precision to fp16 subnormals and
 operands above 65504 become `inf`. See the `main` branch README.
