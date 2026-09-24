@@ -14,6 +14,8 @@
 # because the batched defect was hidden for a while behind "one element out of
 # 8192 is slightly over atol".
 
+import warnings
+
 import pytest
 import torch
 
@@ -96,7 +98,7 @@ def test_batched_dot_more_batches_than_warps(B, num_warps, dtype, device):
 
 
 @triton.jit
-def f32_dot_kernel(a_ptr, b_ptr, c_ptr, BLOCK: tl.constexpr):
+def square_dot_kernel(a_ptr, b_ptr, c_ptr, BLOCK: tl.constexpr):
     offs_m = tl.arange(0, BLOCK)
     offs_n = tl.arange(0, BLOCK)
     a = tl.load(a_ptr + offs_m[:, None] * BLOCK + offs_n[None, :])
@@ -124,9 +126,45 @@ def test_f32_dot_does_not_use_mma(device):
     b = torch.randint(-4, 5, (BLOCK, BLOCK), device=device).to(torch.float32)
     c = torch.empty((BLOCK, BLOCK), dtype=torch.float32, device=device)
 
-    k = f32_dot_kernel[(1, )](a, b, c, BLOCK=BLOCK)
+    k = square_dot_kernel[(1, )](a, b, c, BLOCK=BLOCK)
     torch.testing.assert_close(c.to(torch.float64),
                                torch.mm(a.to(torch.float64), b.to(torch.float64)),
                                atol=0, rtol=0)
     assert "mma.sync" not in k.asm["ptx"], \
         "Turing has no TF32 tensor core; an f32 dot must lower to FMA"
+
+
+@pytest.mark.parametrize("dtype, as_f16, expect_warning", [
+    ("bfloat16", False, True),
+    ("bfloat16", True, False),
+    ("float16", False, False),
+])
+def test_bf16_fma_fallback_warns(dtype, as_f16, expect_warning, device, fresh_triton_cache):
+    """A bf16 dot that falls back to FMA must say so.
+
+    Turing has no bf16 MMA, so the dot silently lands on FMA: an order of
+    magnitude slower, and ptxas can take minutes on a large tile. MLIR
+    diagnostics are off by default, so the backend raises a Python warning
+    pointing at sm75_bf16_dot_as_f16. The fresh cache matters: a cache hit
+    skips make_ttgir, and with it the warning.
+    """
+    if not is_cuda():
+        pytest.skip("sm75 Tensor Core path is CUDA-only")
+    if torch.cuda.get_device_capability() != (7, 5):
+        pytest.skip("Ampere and later have bf16 MMA")
+
+    BLOCK = 32
+    torch.manual_seed(0)
+    a = torch.randint(-4, 5, (BLOCK, BLOCK), device=device).to(getattr(torch, dtype))
+    b = torch.randint(-4, 5, (BLOCK, BLOCK), device=device).to(getattr(torch, dtype))
+    c = torch.empty((BLOCK, BLOCK), dtype=torch.float32, device=device)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        k = square_dot_kernel[(1, )](a, b, c, BLOCK=BLOCK, sm75_bf16_dot_as_f16=as_f16)
+    hits = [w for w in caught if "sm75_bf16_dot_as_f16" in str(w.message)]
+    assert bool(hits) == expect_warning, [str(w.message) for w in caught]
+    assert ("mma.sync" in k.asm["ptx"]) != expect_warning
+    torch.testing.assert_close(c.to(torch.float64),
+                               torch.mm(a.to(torch.float64), b.to(torch.float64)),
+                               atol=0, rtol=0)

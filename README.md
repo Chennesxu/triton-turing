@@ -82,9 +82,11 @@ hand-tuned vendor library, across the mid-to-large size range (three passes,
 Turing's `mma.sync` has no bf16 form, so a bf16 `tl.dot` falls back to CUDA-core
 FMA. bf16 is the default dtype for vLLM, SGLang and most Hugging Face
 checkpoints, so a large share of real workloads never touch the Tensor Cores.
+Compiling such a kernel raises a `UserWarning` that names it.
 
-`TRITON_SM75_BF16_DOT_AS_F16=1` converts bf16 dot operands to fp16 and issues
-`m16n8k8`, accumulating in fp32:
+`TRITON_SM75_BF16_DOT_AS_F16=1` (or `sm75_bf16_dot_as_f16=True` on a single
+launch) converts bf16 dot operands to fp16 and issues `m16n8k8`, accumulating
+in fp32:
 
 | GEMM | FMA | Tensor Core | Speedup |
 |---|---|---|---|

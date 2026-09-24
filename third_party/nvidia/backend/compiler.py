@@ -13,6 +13,7 @@ import tempfile
 import signal
 import os
 import subprocess
+import warnings
 from pathlib import Path
 
 
@@ -107,6 +108,28 @@ def sm_arch_from_capability(capability: int):
     # TODO: Handle non-"a" sms
     suffix = "a" if capability >= 90 else ""
     return f"sm_{capability}{suffix}"
+
+
+def warn_sm75_bf16_fma_dot(mod):
+    # Turing's mma.sync has no bf16 form, so AccelerateMatmul leaves a bf16 dot
+    # on FMA unless sm75_bf16_dot_as_f16 is set. MLIR diagnostics are hidden by
+    # default and the FMA path is an order of magnitude slower -- and can keep
+    # ptxas busy for minutes -- so say it here, once per kernel. Checked on the
+    # TTIR: by the end of make_ttgir an FMA dot's operands are already f32. A
+    # dot_scaled computes in bf16 unless one side is fp16 (DecomposeScaledBlocked).
+    src = str(mod)
+    bf16_dot = re.search(r"tt\.dot .*xbf16", src)
+    scaled_sides = re.findall(r"tt\.dot_scaled .* lhs = (\w+) rhs = (\w+)", src)
+    bf16_scaled = any("fp16" not in sides for sides in scaled_sides)
+    if not (bf16_dot or bf16_scaled):
+        return
+    name = re.search(r"tt\.func public @([\w$]+)", src)
+    warnings.warn(
+        f"{name.group(1) if name else 'kernel'}: a dot computed in bf16 runs on FMA, not the tensor core -- "
+        "sm75 has no bf16 MMA. Expect it to be an order of magnitude slower and slow to compile. Pass "
+        "sm75_bf16_dot_as_f16=True to the launch (or set TRITON_SM75_BF16_DOT_AS_F16=1) to run it on the "
+        "fp16 tensor core: bf16 mantissas are exact in fp16, but values outside fp16's range "
+        "(|x| > 65504, or below 6.1e-5 where fp16 turns subnormal) are not.", stacklevel=2)
 
 
 @dataclass(frozen=True)
@@ -268,6 +291,8 @@ class CUDABackend(BaseBackend):
 
     @staticmethod
     def make_ttgir(mod, metadata, opt, capability):
+        if capability == 75 and not opt.sm75_bf16_dot_as_f16:
+            warn_sm75_bf16_fma_dot(mod)
         # Set maxnreg on all kernels, if it was provided.
         if opt.maxnreg is not None:
             mod.set_attr("ttg.maxnreg", ir.builder(mod.context).get_int32_attr(opt.maxnreg))
