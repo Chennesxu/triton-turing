@@ -35,8 +35,8 @@ are still throttle-prone.
 
 The Triton FA2 forward kernel (tutorial `06-fused-attention.py` plus our sm75
 pipeline) is the fastest at every size measured. It is ahead of a from-scratch
-CUDA/CUTLASS FlashAttention for Turing by **+21–26%** at head dim 64 and
-**+8–10%** at head dim 128, and ahead of PyTorch SDPA (xformers backend) by
+CUDA/CUTLASS FlashAttention for Turing by **+21–28%** at head dim 64 and
+**+7–11%** at head dim 128, and ahead of PyTorch SDPA (xformers backend) by
 **1.8–2.1×**. Attention benefits from the pipeline because the softmax
 dependency chain leaves the Tensor Cores idle, and the pipeline uses that window
 to prefetch K/V.
@@ -45,18 +45,17 @@ to prefetch K/V.
 
 ![FlashAttention-2 backward](.github/assets/benchmarks/fa2-backward.png)
 
-At head dim 64 our kernel beats the CUDA/CUTLASS implementation by **+35–40%**,
-from Turing-specific block sizes plus a codegen change that lets a transposed
-dot operand read the shared buffer its untransposed sibling already filled,
-instead of paying a scratch round trip every loop iteration.
+At head dim 64 our kernel beats the CUDA/CUTLASS implementation by **+49–50%**.
+Three Turing-specific changes add up to that: block sizes that fit 64 KB, a
+codegen change that lets a transposed dot operand read the shared buffer its
+untransposed sibling already filled, and launching the dK/dV and dQ halves as two
+kernels so each gets its own tiling and the full 64 KB.
 
-At head dim 128 it **trails by 15–16%**, the only place we lose. Upstream's
-d=128 backward blocks need ~82 KB of shared memory, well past Turing's hard
-**64 KB/CTA** limit, so `BLOCK_N1` and `BLOCK_M2` are halved to 64 to fit. An
-exhaustive sweep of the 216-configuration block/stage/warp space confirms that
-fallback is the fastest option available, not a tuning oversight: every larger
-tile that fits forces `num_stages=1`, and losing the pipeline costs more than
-the tile gains.
+At head dim 128 it **trails by 12–14%**, the only place we lose. Splitting the
+kernel removes its register spills but gains only 1–2% here. With the same
+64×64 tile and 8 warps as the CUDA kernel and no spills, our dK/dV kernel is
+still 17% slower, so what remains is in code generation, not in the
+configuration.
 
 ### Integer GEMM — INT4 doubles INT8, and cuBLAS has no INT4 path
 

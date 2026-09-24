@@ -379,7 +379,10 @@ def _attn_bwd(Q, K, V, sm_scale,  #
               BLOCK_N2: tl.constexpr,  #
               BLK_SLICE_FACTOR: tl.constexpr,  #
               HEAD_DIM: tl.constexpr,  #
-              CAUSAL: tl.constexpr):
+              CAUSAL: tl.constexpr,  #
+              # 0: both halves in one program. 1: dK/dV only, 2: dQ only -- two
+              # launches, each with its own grid and config (see backward()).
+              PHASE: tl.constexpr = 0):
     LN2: tl.constexpr = 0.6931471824645996  # = ln(2)
 
     # The launch grid is sized N_CTX // BLOCK_N1, but the two halves of this
@@ -388,7 +391,8 @@ def _attn_bwd(Q, K, V, sm_scale,  #
     # block sizes agree -- a smaller BLOCK_M2 silently leaves the tail of dQ
     # unwritten, a larger one reads out of bounds. Upstream never trips this
     # because it hardcodes 128 for both, but it is easy to hit when autotuning.
-    tl.static_assert(BLOCK_N1 == BLOCK_M2)
+    if PHASE == 0:
+        tl.static_assert(BLOCK_N1 == BLOCK_M2)
 
     bhid = tl.program_id(2)
     off_chz = (bhid * N_CTX).to(tl.int64)
@@ -409,105 +413,107 @@ def _attn_bwd(Q, K, V, sm_scale,  #
     # load scales
     offs_k = tl.arange(0, HEAD_DIM)
 
-    start_n = pid * BLOCK_N1
-    start_m = 0
+    if PHASE != 2:
+        start_n = pid * BLOCK_N1
+        start_m = 0
 
-    MASK_BLOCK_M1: tl.constexpr = BLOCK_M1 // BLK_SLICE_FACTOR
-    offs_n = start_n + tl.arange(0, BLOCK_N1)
+        MASK_BLOCK_M1: tl.constexpr = BLOCK_M1 // BLK_SLICE_FACTOR
+        offs_n = start_n + tl.arange(0, BLOCK_N1)
 
-    dv = tl.zeros([BLOCK_N1, HEAD_DIM], dtype=tl.float32)
-    dk = tl.zeros([BLOCK_N1, HEAD_DIM], dtype=tl.float32)
+        dv = tl.zeros([BLOCK_N1, HEAD_DIM], dtype=tl.float32)
+        dk = tl.zeros([BLOCK_N1, HEAD_DIM], dtype=tl.float32)
 
-    # load K and V: they stay in SRAM throughout the inner loop.
-    k = tl.load(K + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d)
-    v = tl.load(V + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d)
+        # load K and V: they stay in SRAM throughout the inner loop.
+        k = tl.load(K + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d)
+        v = tl.load(V + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d)
 
-    if CAUSAL:
-        start_m = start_n
-        num_steps = BLOCK_N1 // MASK_BLOCK_M1
-        dk, dv = _attn_bwd_dkdv(dk, dv,  #
-                                Q, k, v, sm_scale,  #
-                                DO,  #
-                                M, D,  #
-                                stride_tok, stride_d,  #
-                                H, N_CTX,  #
-                                MASK_BLOCK_M1, BLOCK_N1, HEAD_DIM,  #
-                                start_n, start_m, num_steps,  #
-                                MASK=True,  #
-                                )
+        if CAUSAL:
+            start_m = start_n
+            num_steps = BLOCK_N1 // MASK_BLOCK_M1
+            dk, dv = _attn_bwd_dkdv(dk, dv,  #
+                                    Q, k, v, sm_scale,  #
+                                    DO,  #
+                                    M, D,  #
+                                    stride_tok, stride_d,  #
+                                    H, N_CTX,  #
+                                    MASK_BLOCK_M1, BLOCK_N1, HEAD_DIM,  #
+                                    start_n, start_m, num_steps,  #
+                                    MASK=True,  #
+                                    )
 
-        start_m += num_steps * MASK_BLOCK_M1
+            start_m += num_steps * MASK_BLOCK_M1
 
-    # Compute dK and dV for non-masked blocks.
-    num_steps = (N_CTX - start_m) // BLOCK_M1
-    dk, dv = _attn_bwd_dkdv(  #
-        dk, dv,  #
-        Q, k, v, sm_scale,  #
-        DO,  #
-        M, D,  #
-        stride_tok, stride_d,  #
-        H, N_CTX,  #
-        BLOCK_M1, BLOCK_N1, HEAD_DIM,  #
-        start_n, start_m, num_steps,  #
-        MASK=False,  #
-    )
+        # Compute dK and dV for non-masked blocks.
+        num_steps = (N_CTX - start_m) // BLOCK_M1
+        dk, dv = _attn_bwd_dkdv(  #
+            dk, dv,  #
+            Q, k, v, sm_scale,  #
+            DO,  #
+            M, D,  #
+            stride_tok, stride_d,  #
+            H, N_CTX,  #
+            BLOCK_M1, BLOCK_N1, HEAD_DIM,  #
+            start_n, start_m, num_steps,  #
+            MASK=False,  #
+        )
 
-    dv_ptrs = DV + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d
-    tl.store(dv_ptrs, dv)
+        dv_ptrs = DV + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d
+        tl.store(dv_ptrs, dv)
 
-    # Write back dK.
-    dk *= sm_scale
-    dk_ptrs = DK + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d
-    tl.store(dk_ptrs, dk)
+        # Write back dK.
+        dk *= sm_scale
+        dk_ptrs = DK + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d
+        tl.store(dk_ptrs, dk)
 
-    # THIS BLOCK DOES DQ:
-    start_m = pid * BLOCK_M2
-    start_n = 0
-    num_steps = N_CTX // BLOCK_N2
+    if PHASE != 1:
+        # THIS BLOCK DOES DQ:
+        start_m = pid * BLOCK_M2
+        start_n = 0
+        num_steps = N_CTX // BLOCK_N2
 
-    MASK_BLOCK_N2: tl.constexpr = BLOCK_N2 // BLK_SLICE_FACTOR
-    offs_m = start_m + tl.arange(0, BLOCK_M2)
+        MASK_BLOCK_N2: tl.constexpr = BLOCK_N2 // BLK_SLICE_FACTOR
+        offs_m = start_m + tl.arange(0, BLOCK_M2)
 
-    q = tl.load(Q + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d)
-    dq = tl.zeros([BLOCK_M2, HEAD_DIM], dtype=tl.float32)
-    do = tl.load(DO + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d)
+        q = tl.load(Q + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d)
+        dq = tl.zeros([BLOCK_M2, HEAD_DIM], dtype=tl.float32)
+        do = tl.load(DO + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d)
 
-    m = tl.load(M + offs_m)
-    m = m[:, None]
+        m = tl.load(M + offs_m)
+        m = m[:, None]
 
-    if CAUSAL:
-        # Compute dQ for masked (diagonal) blocks.
-        # NOTE: This code scans each row of QK^T backward (from right to left,
-        # but inside each call to _attn_bwd_dq, from left to right), but that's
-        # not due to anything important.  I just wanted to reuse the loop
-        # structure for dK & dV above as much as possible.
-        end_n = start_m + BLOCK_M2
-        num_steps = BLOCK_M2 // MASK_BLOCK_N2
+        if CAUSAL:
+            # Compute dQ for masked (diagonal) blocks.
+            # NOTE: This code scans each row of QK^T backward (from right to left,
+            # but inside each call to _attn_bwd_dq, from left to right), but that's
+            # not due to anything important.  I just wanted to reuse the loop
+            # structure for dK & dV above as much as possible.
+            end_n = start_m + BLOCK_M2
+            num_steps = BLOCK_M2 // MASK_BLOCK_N2
+            dq = _attn_bwd_dq(dq, q, K, V,  #
+                              do, m, D,  #
+                              stride_tok, stride_d,  #
+                              H, N_CTX,  #
+                              BLOCK_M2, MASK_BLOCK_N2, HEAD_DIM,  #
+                              start_m, end_n - num_steps * MASK_BLOCK_N2, num_steps,  #
+                              MASK=True,  #
+                              )
+            end_n -= num_steps * MASK_BLOCK_N2
+            # stage 2
+            num_steps = end_n // BLOCK_N2
+            start_n = end_n - num_steps * BLOCK_N2
+
         dq = _attn_bwd_dq(dq, q, K, V,  #
                           do, m, D,  #
                           stride_tok, stride_d,  #
                           H, N_CTX,  #
-                          BLOCK_M2, MASK_BLOCK_N2, HEAD_DIM,  #
-                          start_m, end_n - num_steps * MASK_BLOCK_N2, num_steps,  #
-                          MASK=True,  #
+                          BLOCK_M2, BLOCK_N2, HEAD_DIM,  #
+                          start_m, start_n, num_steps,  #
+                          MASK=False,  #
                           )
-        end_n -= num_steps * MASK_BLOCK_N2
-        # stage 2
-        num_steps = end_n // BLOCK_N2
-        start_n = end_n - num_steps * BLOCK_N2
-
-    dq = _attn_bwd_dq(dq, q, K, V,  #
-                      do, m, D,  #
-                      stride_tok, stride_d,  #
-                      H, N_CTX,  #
-                      BLOCK_M2, BLOCK_N2, HEAD_DIM,  #
-                      start_m, start_n, num_steps,  #
-                      MASK=False,  #
-                      )
-    # Write back dQ.
-    dq_ptrs = DQ + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
-    dq *= LN2
-    tl.store(dq_ptrs, dq)
+        # Write back dQ.
+        dq_ptrs = DQ + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
+        dq *= LN2
+        tl.store(dq_ptrs, dq)
 
 
 class _attention(torch.autograd.Function):
@@ -594,25 +600,22 @@ class _attention(torch.autograd.Function):
         PRE_BLOCK = 128
         NUM_WARPS, NUM_STAGES = 4, 5
         BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 32, 128, 128, 32
+        # (num_stages, num_warps) per half when the halves are launched apart.
+        phases = None
         if is_cuda() and torch.cuda.get_device_capability() == (7, 5):
-            # Turing: 64KB shared memory per CTA (Ampere+: >= 100KB). Both
-            # branches below are the fastest point of an exhaustive sweep over
-            # BLOCK_M1/N1/M2/N2 x num_stages x num_warps, filtered by the 64KB
-            # budget and by BLOCK_N1 == BLOCK_M2 (see the static_assert in
-            # _attn_bwd).
+            # Turing: 64KB shared memory per CTA (Ampere+: >= 100KB). In one
+            # program both halves share a config, a register budget and
+            # BLOCK_N1 == BLOCK_M2, and every such config sits at 255 registers
+            # and spills. Launched apart -- as ssiu's hand-written Turing
+            # kernels are -- each half gets the full 64KB and its own tiling:
+            # +8-9% at HEAD_DIM=64, +1-2.4% at 128. Each is the fastest point of
+            # a sweep over that half's blocks x num_stages x num_warps.
             if ctx.HEAD_DIM > 64:
-                # Upstream's blocks need ~82KB here, so halve the K/V (resp. Q)
-                # row blocks. Every larger tile that fits forces num_stages=1,
-                # and losing the pipeline costs more than the tile gains.
-                BLOCK_N1, BLOCK_M2 = 64, 64
+                BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 64, 64, 64, 32
+                phases = ((1, 8), (3, 4))
             else:
-                # At HEAD_DIM=64 the tiles are half the bytes, so the inner
-                # steps can double and still keep the pipeline: ~+4.6% over the
-                # upstream blocks, consistently across N=1024..8192. The wider
-                # tile needs 8 warps -- at 4 it is less than half as fast.
-                BLOCK_M1, BLOCK_N2 = 64, 64
-                NUM_WARPS = 8
-            NUM_STAGES = 2
+                BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 64, 64, 64, 64
+                phases = ((1, 4), (2, 4))
         BLK_SLICE_FACTOR = 2
         RCP_LN2 = 1.4426950408889634  # = 1.0 / ln(2)
         arg_k = k
@@ -627,20 +630,21 @@ class _attention(torch.autograd.Function):
             BATCH, N_HEAD, N_CTX,  #
             BLOCK_M=PRE_BLOCK, HEAD_DIM=ctx.HEAD_DIM  #
         )
-        grid = (N_CTX // BLOCK_N1, 1, BATCH * N_HEAD)
-        _attn_bwd[grid](
+        args = (
             q, arg_k, v, ctx.sm_scale, do, dq, dk, dv,  #
             M, delta,  #
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),  #
             N_HEAD, N_CTX,  #
-            BLOCK_M1=BLOCK_M1, BLOCK_N1=BLOCK_N1,  #
-            BLOCK_M2=BLOCK_M2, BLOCK_N2=BLOCK_N2,  #
-            BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,  #
-            HEAD_DIM=ctx.HEAD_DIM,  #
-            num_warps=NUM_WARPS,  #
-            num_stages=NUM_STAGES,  #
-            CAUSAL=ctx.causal,  #
         )
+        blocks = dict(BLOCK_M1=BLOCK_M1, BLOCK_N1=BLOCK_N1, BLOCK_M2=BLOCK_M2, BLOCK_N2=BLOCK_N2,
+                      BLK_SLICE_FACTOR=BLK_SLICE_FACTOR, HEAD_DIM=ctx.HEAD_DIM, CAUSAL=ctx.causal)
+        if phases is None:
+            _attn_bwd[(N_CTX // BLOCK_N1, 1, BATCH * N_HEAD)](*args, **blocks, num_warps=NUM_WARPS,
+                                                               num_stages=NUM_STAGES)
+        else:
+            for phase, rows, (stages, warps) in zip((1, 2), (BLOCK_N1, BLOCK_M2), phases):
+                _attn_bwd[(N_CTX // rows, 1, BATCH * N_HEAD)](*args, **blocks, PHASE=phase, num_warps=warps,
+                                                              num_stages=stages)
 
         return dq, dk, dv, None, None, None, None
 
