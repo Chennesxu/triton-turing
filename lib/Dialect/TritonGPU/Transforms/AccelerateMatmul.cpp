@@ -108,9 +108,41 @@ static int getMMAVersionSafe(int computeCapability, DotOp op,
   return 0;
 }
 
+// sm75: the warp grid for a function's chained dots when upstream would pick
+// [1, numWarps] (see warpsPerTileV2). That keeps nothing in registers --
+// the chained operand crosses warps through shared memory either way -- and
+// makes every warp load the whole A operand of every dot. Pick instead the
+// grid that minimises what each warp loads: a warp owning an (M/wm) x (N/wn)
+// tile of an MxNxK dot needs (M/wm) x K of A and K x (N/wn) of B, and a tile
+// smaller than one instruction (16x8) is replicated, not shrunk. The sum runs
+// over every chained dot of the function, so all loops agree and an
+// accumulator carried from one loop into the next needs no conversion. Ties go
+// to more warps along M, which keeps row reductions within fewer warps.
+//
+// In the FA2 backward at d128 (64x128 accumulators) this turns 112 LDSM per
+// iteration into 80 for dK/dV (2x4 instead of 1x8, 8 warps) and 84 into 60
+// for dQ (2x2 instead of 1x4); both run ~14% faster, bit-identical.
+static SmallVector<unsigned>
+chainedDotWarpsPerTileSm75(ArrayRef<std::array<int64_t, 3>> mnk,
+                           int numWarps) {
+  SmallVector<unsigned> best;
+  int64_t bestCost = std::numeric_limits<int64_t>::max();
+  for (int64_t wm = numWarps; wm >= 1; wm /= 2) {
+    int64_t wn = numWarps / wm, cost = 0;
+    for (auto [m, n, k] : mnk)
+      cost += std::max<int64_t>(m / wm, 16) * k +
+              k * std::max<int64_t>(n / wn, 8);
+    if (cost < bestCost) {
+      bestCost = cost;
+      best = {(unsigned)wm, (unsigned)wn};
+    }
+  }
+  return best;
+}
+
 SmallVector<unsigned> warpsPerTileV2(DotOpInterface dotOp,
                                      const ArrayRef<int64_t> shape,
-                                     int numWarps) {
+                                     int numWarps, int computeCapability) {
   auto rank = shape.size();
   // Early exit for batched matmul
   if (rank == 3)
@@ -136,6 +168,33 @@ SmallVector<unsigned> warpsPerTileV2(DotOpInterface dotOp,
     }
   }
   if (hasChainedDot) {
+    auto func = dotOp->getParentOfType<FuncOp>();
+    if (computeCapability == 75 && func) {
+      // Upstream decides on this dot's shape alone, so the answer depends on
+      // which dot of a chain is rewritten first; decide on all of them.
+      SmallVector<std::array<int64_t, 3>> mnk;
+      bool anyWiderThanTall = false;
+      func.walk([&](DotOp dot) {
+        auto d = getShapePerCTA(dot.getD().getType());
+        if (d.size() != 2)
+          return;
+        Operation *op = dot.getOperation();
+        auto sameRegion = [op](Operation *o) {
+          return o->getParentRegion() == op->getParentRegion() &&
+                 !isa<TransOp>(o);
+        };
+        if (!llvm::any_of(mlir::getSlice(op, {sameRegion}, {sameRegion}),
+                          [op](Operation *o) {
+                            return isa<DotOp, DotScaledOp>(o) && o != op;
+                          }))
+          return;
+        mnk.push_back({d[0], d[1], dot.getA().getType().getShape()[1]});
+        anyWiderThanTall |= d[0] < d[1];
+      });
+      if (anyWiderThanTall)
+        return chainedDotWarpsPerTileSm75(mnk, numWarps);
+      return {(unsigned)numWarps, 1};
+    }
     if (shape[0] >= shape[1]) {
       return {(unsigned)numWarps, 1};
     } else {
@@ -275,10 +334,11 @@ getSharedMemoryScale(Value arg, mlir::PatternRewriter &rewriter, Location loc) {
 SmallVector<unsigned, 3>
 getWarpsPerTile(DotOpInterface dotOp, const ArrayRef<int64_t> shape,
                 int version, int numWarps,
-                const SmallVector<unsigned, 3> &instrShape) {
+                const SmallVector<unsigned, 3> &instrShape,
+                int computeCapability) {
   switch (version) {
   case 2:
-    return warpsPerTileV2(dotOp, shape, numWarps);
+    return warpsPerTileV2(dotOp, shape, numWarps, computeCapability);
   case 3:
     return warpsPerTileV3(dotOp, shape, numWarps, instrShape);
   default:
@@ -367,7 +427,7 @@ static MMAEncodingResult createMMAEncodingForDot(DotOpInterface dotOp,
   auto instrShape = mmaVersionToInstrShape(versionMajor, retShapePerCTA,
                                            oldAType.getElementType(), numWarps);
   auto warpsPerTile = getWarpsPerTile(dotOp, retShapePerCTA, versionMajor,
-                                      numWarps, instrShape);
+                                      numWarps, instrShape, computeCapability);
 
   auto mmaEnc = NvidiaMmaEncodingAttr::get(oldRetType.getContext(),
                                            versionMajor, versionMinor,

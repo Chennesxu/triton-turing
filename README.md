@@ -35,27 +35,29 @@ are still throttle-prone.
 
 The Triton FA2 forward kernel (tutorial `06-fused-attention.py` plus our sm75
 pipeline) is the fastest at every size measured. It is ahead of a from-scratch
-CUDA/CUTLASS FlashAttention for Turing by **+21–28%** at head dim 64 and
-**+7–11%** at head dim 128, and ahead of PyTorch SDPA (xformers backend) by
-**1.8–2.1×**. Attention benefits from the pipeline because the softmax
+CUDA/CUTLASS FlashAttention for Turing by **+22–28%** at head dim 64 and
+**+4–10%** at head dim 128, and ahead of PyTorch SDPA (xformers backend) by
+**1.7–2.1×**. Attention benefits from the pipeline because the softmax
 dependency chain leaves the Tensor Cores idle, and the pipeline uses that window
 to prefetch K/V.
 
-### FlashAttention-2 backward — a mixed result, and our one weakness
+### FlashAttention-2 backward — ahead at head dim 64, level at 128
 
 ![FlashAttention-2 backward](.github/assets/benchmarks/fa2-backward.png)
 
-At head dim 64 our kernel beats the CUDA/CUTLASS implementation by **+49–50%**.
+At head dim 64 our kernel beats the CUDA/CUTLASS implementation by **+49–51%**.
 Three Turing-specific changes add up to that: block sizes that fit 64 KB, a
 codegen change that lets a transposed dot operand read the shared buffer its
 untransposed sibling already filled, and launching the dK/dV and dQ halves as two
 kernels so each gets its own tiling and the full 64 KB.
 
-At head dim 128 it **trails by 12–14%**, the only place we lose. Splitting the
-kernel removes its register spills but gains only 1–2% here. With the same
-64×64 tile and 8 warps as the CUDA kernel and no spills, our dK/dV kernel is
-still 17% slower, so what remains is in code generation, not in the
-configuration.
+At head dim 128 it is **level with the CUDA kernel, 1–2% behind**; it used to
+trail by 12–14%. The gap was how the warps split each chained dot. Upstream
+lines the warps up side by side along the 128 columns of the accumulator (1×8,
+1×4), so every warp loads the whole A operand of every dot from shared memory.
+On sm75 we pick the warp grid that loads the least instead: 2×4 for dK/dV and
+2×2 for dQ. That cuts shared-memory loads per iteration by 29% and makes each
+kernel about 14% faster, with bit-identical results.
 
 ### Integer GEMM — INT4 doubles INT8, and cuBLAS has no INT4 path
 
