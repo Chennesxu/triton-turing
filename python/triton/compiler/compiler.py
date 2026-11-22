@@ -57,6 +57,7 @@ class ASTSource:
         self.ext = "ttir"
         self.name = fn.__name__
         self.signature = signature
+        self.specialized_int_types = {}
         self.constants = dict()
         if constexprs is not None:
             for k, v in constexprs.items():
@@ -73,6 +74,8 @@ class ASTSource:
         get_key = lambda x: x.cache_key if hasattr(x, 'cache_key') else str(x)
         constants_key = '-'.join([get_key(v) for k, v in sorted(self.constants.items())])
         key = f"{self.fn.cache_key}-{str(self.attrs)}-{sorted_sig}-{constants_key}"
+        if self.specialized_int_types:
+            key += f"-{sorted(self.specialized_int_types.items())}"
         return hashlib.sha256(key.encode("utf-8")).hexdigest()
 
     def make_ir(self, target: GPUTarget, options, codegen_fns, module_map, context):

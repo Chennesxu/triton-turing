@@ -332,6 +332,11 @@ class KernelParam:
         return "constexpr" in self.annotation
 
     @cached_property
+    def specializes_annotated_integer(self):
+        integer_types = ("i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64")
+        return not self.do_not_specialize and self.annotation_type in integer_types
+
+    @cached_property
     def is_const(self):
         if self.is_constexpr:
             return False
@@ -389,6 +394,10 @@ def serialize_specialization_data(name, signature, constants, attrs, options, ke
     return serialized_obj
 
 
+def _is_implicit_integer_constant(value):
+    return type(value) is int and value == 1
+
+
 def create_function_from_signature(sig, kparams, backend):
     """
     Equivalent to sig.bind followed by apply_defaults. This generates a
@@ -399,6 +408,10 @@ def create_function_from_signature(sig, kparams, backend):
     assert len(sig.parameters) == len(kparams)
     # Create the function argument list and the dict entries for the return statement
     specialization = []
+    spec_prefix = "_spec"
+    while any(n == spec_prefix or n.startswith(f"{spec_prefix}_") for n in sig.parameters):
+        spec_prefix = "_" + spec_prefix
+    is_integer_constant = f"{spec_prefix}_is_integer_constant"
     # signature
     for name, kp in zip(sig.parameters.keys(), kparams):
         if kp.is_constexpr:
@@ -413,7 +426,15 @@ def create_function_from_signature(sig, kparams, backend):
                     if kp.annotation_type == "u1" or kp.annotation_type[:2] in ["fp", "bf"]:
                         # we do not specialize non-constexpr floats and bools:
                         specialize = False
-                if specialize:
+                if kp.specializes_annotated_integer:
+                    # Retain the native specialization for a unit integer. The
+                    # compiler materializes it using the original annotation.
+                    specialization.append(
+                        f'({spec_prefix} if ({spec_prefix} := {ret})[0] == "constexpr" '
+                        f'and {is_integer_constant}({spec_prefix}[1]) '
+                        f'else ("{kp.annotation_type}",) + {spec_prefix}[1:])'
+                    )
+                elif specialize:
                     specialization.append(f'("{kp.annotation_type}",) + {ret}[1:]')
                 else:
                     # skip runtime specialization:
@@ -444,6 +465,7 @@ def dynamic_func({", ".join(list(map(arg, sig.parameters.items())) + ["**options
 
     specialize_impl = native_specialize_impl
     func_namespace["specialize_impl"] = specialize_impl
+    func_namespace[is_integer_constant] = _is_implicit_integer_constant
     func_namespace["backend"] = backend
     func_namespace["JITCallable"] = JITCallable
 
@@ -875,6 +897,12 @@ class JITFunction(JITCallable, KernelInterface[T]):
                            warmup):
             return None
         src = self.ASTSource(self, signature, constexprs, attrs)
+        for path, value in constexprs.items():
+            if len(path) != 1 or not _is_implicit_integer_constant(value):
+                continue
+            param = self.params[path[0]]
+            if param.specializes_annotated_integer and signature[param.name] == "constexpr":
+                src.specialized_int_types[param.name] = param.annotation_type
 
         async_mode = _async_compile.active_mode.get()
         if async_mode is not None:

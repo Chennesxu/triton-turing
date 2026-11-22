@@ -277,7 +277,8 @@ class CodeGenerator(ast.NodeVisitor):
 
     def __init__(self, context, prototype, gscope, function_name, jit_fn: JITFunction, *, options, codegen_fns,
                  module_map, is_gluon, module=None, is_kernel=False, function_types: Optional[Dict] = None,
-                 noinline=False, caller_context=None, file_name: Optional[str] = None, begin_line=0, begin_col=1):
+                 noinline=False, caller_context=None, file_name: Optional[str] = None, begin_line=0, begin_col=1,
+                 specialized_int_types=None):
         self.context = context
         self.is_gluon = is_gluon
         if is_gluon:
@@ -304,6 +305,7 @@ class CodeGenerator(ast.NodeVisitor):
         self.module = self.builder.create_module() if module is None else module
         self.function_ret_types = {} if function_types is None else function_types
         self.prototype = prototype
+        self.specialized_int_types = specialized_int_types or {}
 
         self.return_vals: List[base_value | None] = []
         self.return_ips: List[Tuple[ir.InsertPoint, ir.Loc]] = []
@@ -647,12 +649,17 @@ class CodeGenerator(ast.NodeVisitor):
         arg_values = self.prototype.deserialize(self.fn)
         if self.caller_context is not None:
             self.caller_context.initialize_callee(self.fn, self.builder)
-        # bind arguments to symbols
-        for arg_name, arg_value in zip(arg_names, arg_values):
-            self._maybe_set_loc_to_name(arg_value, arg_name)
-            self.set_value(arg_name, arg_value)
         insert_pt = self.builder.get_insertion_block()
         self.builder.set_insertion_point_to_start(entry)
+        # bind arguments to symbols
+        for arg_name, arg_value in zip(arg_names, arg_values):
+            if arg_name in self.specialized_int_types:
+                # Keep the parameter out of the ABI while retaining its dtype
+                # and tensor promotion rules inside the kernel.
+                dtype = str_to_ty(self.specialized_int_types[arg_name], None)
+                arg_value = self.cast_to(arg_value, dtype)
+            self._maybe_set_loc_to_name(arg_value, arg_name)
+            self.set_value(arg_name, arg_value)
         # visit function body
         self.visit_compound_statement(node.body)
 
@@ -1688,7 +1695,8 @@ def ast_to_ttir(fn, src, context, options, codegen_fns, module_map, module=None)
     generator = CodeGenerator(context, prototype, gscope=fn.get_capture_scope(), function_name=fn.repr(proxy),
                               jit_fn=fn, is_kernel=True, file_name=fn.file_name, begin_line=fn.def_file_line_number,
                               begin_col=fn.def_file_col_number, options=options, codegen_fns=codegen_fns,
-                              module_map=module_map, module=module, is_gluon=fn.is_gluon())
+                              module_map=module_map, module=module, is_gluon=fn.is_gluon(),
+                              specialized_int_types=src.specialized_int_types)
     generator.visit(fn.parse())
     module = generator.module
     # module takes ownership of the context
