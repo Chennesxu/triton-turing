@@ -44,6 +44,10 @@ def is_hopper():
     return is_cuda() and torch.cuda.get_device_capability()[0] == 9
 
 
+def is_turing():
+    return is_cuda() and torch.cuda.get_device_capability() == (7, 5)
+
+
 @triton.jit
 def _attn_fwd_inner(acc, l_i, m_i, q,  #
                     desc_k, desc_v,  #
@@ -132,8 +136,10 @@ elif supports_host_descriptor():
 else:
     NUM_STAGES_OPTIONS = [2, 3, 4]
 
+_CONFIG_PRE_HOOK = None if is_turing() else _host_descriptor_pre_hook
+
 configs = [
-    triton.Config({'BLOCK_M': BM, 'BLOCK_N': BN}, num_stages=s, num_warps=w, pre_hook=_host_descriptor_pre_hook) \
+    triton.Config({'BLOCK_M': BM, 'BLOCK_N': BN}, num_stages=s, num_warps=w, pre_hook=_CONFIG_PRE_HOOK) \
     for BM in [64, 128]\
     for BN in [32, 64, 128]\
     for s in NUM_STAGES_OPTIONS \
@@ -142,7 +148,7 @@ configs = [
 if "PYTEST_VERSION" in os.environ:
     # Use a single config in testing for reproducibility
     configs = [
-        triton.Config(dict(BLOCK_M=128, BLOCK_N=64), num_stages=2, num_warps=4, pre_hook=_host_descriptor_pre_hook),
+        triton.Config(dict(BLOCK_M=128, BLOCK_N=64), num_stages=2, num_warps=4, pre_hook=_CONFIG_PRE_HOOK),
     ]
 
 
@@ -159,10 +165,32 @@ def prune_invalid_configs(configs, named_args, **kwargs):
 
     # Filter out configs where BLOCK_M > N_CTX
     # Filter out configs where BLOCK_M < BLOCK_N when causal is True
-    return [
+    pruned = [
         conf for conf in configs if conf.kwargs.get("BLOCK_M", 0) <= N_CTX and (
             conf.kwargs.get("BLOCK_M", 0) >= conf.kwargs.get("BLOCK_N", 0) or STAGE == 1)
     ]
+    if not is_turing() or kwargs.get("FP8_OUTPUT", False):
+        return pruned
+
+    HEAD_DIM = kwargs.get("HEAD_DIM")
+    if HEAD_DIM == 64 and STAGE == 3:
+        # SM75 causal D64: 128x32 s2 w8 is consistently ~25-26% slower than
+        # 128x64 s2 w4 across N=2048/4096/8192 and caused autotune cliff flips.
+        pruned = [
+            conf for conf in pruned
+            if not (conf.kwargs.get("BLOCK_M") == 128 and conf.kwargs.get("BLOCK_N") == 32
+                    and conf.num_stages == 2 and conf.num_warps == 8)
+        ]
+    elif HEAD_DIM == 128:
+        # SM75 D128 (64KB shared budget): latency clamping folds higher stages
+        # into byte-identical cubins (s2==s3==s4 for BN>=64; s3==s4 for 128x32).
+        pruned = [
+            conf for conf in pruned
+            if not ((conf.kwargs.get("BLOCK_N", 0) >= 64 and conf.num_stages > 2) or (
+                conf.kwargs.get("BLOCK_M") == 128 and conf.kwargs.get("BLOCK_N") == 32
+                and conf.num_stages > 3))
+        ]
+    return pruned
 
 
 @triton.jit
@@ -173,7 +201,10 @@ def _maybe_make_tensor_desc(desc_or_ptr, shape, strides, block_shape):
         return tl.make_tensor_descriptor(desc_or_ptr, shape, strides, block_shape)
 
 
-@triton.autotune(configs=list(filter(keep, configs)), key=["N_CTX", "HEAD_DIM", "FP8_OUTPUT", "warp_specialize"],
+_AUTOTUNE_KEYS = ["N_CTX", "HEAD_DIM", "FP8_OUTPUT", "warp_specialize"] + (["STAGE"] if is_turing() else [])
+
+
+@triton.autotune(configs=list(filter(keep, configs)), key=_AUTOTUNE_KEYS,
                  prune_configs_by={'early_config_prune': prune_invalid_configs})
 @triton.jit
 def _attn_fwd(sm_scale, M,  #
