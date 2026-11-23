@@ -15,9 +15,11 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"
 #include "mlir/Transforms/RegionUtils.h"
+#include "llvm/ADT/EquivalenceClasses.h"
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Dialect/TritonGPU/IR/TritonGPUInterfaces.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/TritonGPUConversion.h"
@@ -34,6 +36,110 @@ namespace mlir::triton::gpu {
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
 namespace {
+
+static Attribute getTensorEncoding(Value value) {
+  auto tensorType = dyn_cast<RankedTensorType>(value.getType());
+  return tensorType ? tensorType.getEncoding() : Attribute();
+}
+
+static bool isBlockedOrBlockedSliceEncoding(Attribute encoding) {
+  if (isa_and_nonnull<BlockedEncodingAttr>(encoding))
+    return true;
+  auto sliceEncoding = dyn_cast_or_null<SliceEncodingAttr>(encoding);
+  return sliceEncoding && isa<BlockedEncodingAttr>(sliceEncoding.getParent());
+}
+
+static bool isSm75Target(FuncOp funcOp) {
+  auto moduleOp = funcOp->getParentOfType<ModuleOp>();
+  if (!moduleOp)
+    return false;
+  auto targetAttr = moduleOp->getAttrOfType<StringAttr>(AttrTargetName);
+  return targetAttr && targetAttr.getValue().starts_with("cuda:") &&
+         getNVIDIAComputeCapability(moduleOp) == 75;
+}
+
+// Synthesize the blocked parent encoding whose slice along `op.getAxis()`
+// distributes the source tensor identically to `encoding` (inserting 1 element,
+// 1 lane, 1 warp, and 1 CTA along the expanded axis as the slowest dimension).
+static Attribute getExpandDimsParentEncoding(ExpandDimsOp op,
+                                             Attribute encoding) {
+  auto blocked = dyn_cast<BlockedEncodingAttr>(encoding);
+  if (!blocked)
+    return {};
+  unsigned axis = op.getAxis();
+  unsigned srcRank = blocked.getOrder().size();
+  if (axis > srcRank)
+    return {};
+  auto insertOne = [&](ArrayRef<unsigned> values) {
+    SmallVector<unsigned> result(values);
+    result.insert(result.begin() + axis, 1);
+    return result;
+  };
+  auto insertSlowest = [&](ArrayRef<unsigned> order) {
+    SmallVector<unsigned> result;
+    result.reserve(order.size() + 1);
+    for (unsigned d : order)
+      result.push_back(d >= axis ? d + 1 : d);
+    result.push_back(axis);
+    return result;
+  };
+
+  MLIRContext *ctx = op.getContext();
+  LinearLayout cgaLL = blocked.getCGALayout().getLinearLayout();
+  auto bases = cgaLL.getBases();
+  for (auto &kv : bases) {
+    for (auto &vec : kv.second)
+      vec.insert(vec.begin() + axis, 0);
+  }
+  auto outDims = llvm::to_vector(cgaLL.getOutDims());
+  outDims.insert(outDims.begin() + axis, {StringAttr(), 1});
+  for (unsigned i = 0; i < outDims.size(); ++i)
+    outDims[i].first = StringAttr::get(ctx, "dim" + std::to_string(i));
+  auto parentCga = CGAEncodingAttr::get(
+      ctx, LinearLayout(std::move(bases), outDims, /*requireSurjective=*/false));
+  return BlockedEncodingAttr::get(ctx, insertOne(blocked.getSizePerThread()),
+                                  insertOne(blocked.getThreadsPerWarp()),
+                                  insertOne(blocked.getWarpsPerCTA()),
+                                  insertSlowest(blocked.getOrder()), parentCga);
+}
+
+static bool isEquivalentEncoding(Value value, Attribute a, Attribute b) {
+  if (a == b)
+    return true;
+  auto type = dyn_cast<RankedTensorType>(value.getType());
+  if (!type || !a || !b || !isa<LayoutEncodingTrait>(a) ||
+      !isa<LayoutEncodingTrait>(b))
+    return false;
+  return areLayoutsEquivalent(type.getShape(), cast<LayoutEncodingTrait>(a),
+                              cast<LayoutEncodingTrait>(b));
+}
+
+static bool isExpensiveMathOp(Operation *op);
+static int64_t getByteCount(Value result, int64_t minElementCount = 0,
+                            int64_t minBitWidth = 0);
+
+static int64_t getScopeLoopFrequencyWeight(Operation *enclosing) {
+  constexpr int64_t kLoopIterationWeight = 8;
+  constexpr int kMaxWeightedLoopDepth = 3;
+  int depth = 0;
+  for (Operation *op = enclosing; op && depth < kMaxWeightedLoopDepth;
+       op = op->getParentOp())
+    if (isa<scf::ForOp, scf::WhileOp>(op))
+      ++depth;
+  int64_t weight = 1;
+  for (int i = 0; i < depth; ++i)
+    weight *= kLoopIterationWeight;
+  return weight;
+}
+
+static int64_t getOpLoopFrequencyWeight(Operation *op) {
+  return getScopeLoopFrequencyWeight(op->getParentOp());
+}
+
+static int64_t getConvertUnitCost(Value value) {
+  int64_t cost = 32 * getByteCount(value, 32, 32);
+  return cost == 0 ? 1 : cost;
+}
 
 // -----------------------------------------------------------------------------
 //
@@ -64,8 +170,11 @@ public:
     LayoutInfo(Attribute encoding) { encodings.insert(encoding); }
     LayoutInfo() {}
     llvm::SmallSetVector<Attribute, 8> encodings;
+    // Encodings that arrived only via synthesized expand_dims parents.
+    llvm::SmallDenseSet<Attribute, 4> derivedEncodings;
   };
-  LayoutPropagation(FuncOp F) : funcOp(F) {}
+  LayoutPropagation(FuncOp F)
+      : funcOp(F), enableSm75LoopComponent(isSm75Target(F)) {}
   // Find the anchor ops and set their layout in the data structure.
   void initAnchorLayout();
   // Recursively Propagate the layout to all the users of the anchor ops until
@@ -79,6 +188,9 @@ public:
                    SmallVector<Value> &changed, Operation *op);
   // Resolve cases where a value has multiple layouts associated to it.
   void resolveConflicts();
+  // Component-level resolution for scf.for-bound blocked components.
+  void resolveConflictsByComponent(
+      const llvm::MapVector<Value, SmallVector<Attribute>> &candidates);
   // Rewrite the IR for the full module.
   void rewrite();
   // Rewrite the IR for a region.
@@ -108,6 +220,7 @@ private:
   // original encodings of tensor values rewritten in place.
   DenseMap<Value, Attribute> originalEncodings;
   FuncOp funcOp;
+  bool enableSm75LoopComponent = false;
 };
 
 class LayoutRematerialization {
@@ -251,15 +364,35 @@ void LayoutPropagation::setEncoding(ValueRange values, LayoutInfo &info,
     bool hasChanged = false;
     for (auto encoding : info.encodings) {
       Attribute dstEncoding;
+      bool derived = info.derivedEncodings.contains(encoding);
       if (isa<ConvertLayoutOp>(op)) {
         // Try to remove the convert by making the dst encoding match the source
         // encoding.
         dstEncoding = encoding;
       } else {
         dstEncoding = inferDstEncoding(op, encoding);
+        // inferDstEncoding cannot expand a blocked (non-slice) source. Directly
+        // inside an scf.for body on SM75, where the convert this avoids would
+        // run every iteration, synthesize the blocked parent the source is a
+        // slice of.
+        if (auto expandOp = dyn_cast<ExpandDimsOp>(op);
+            enableSm75LoopComponent && expandOp && !dstEncoding &&
+            isa<scf::ForOp>(op->getParentOp())) {
+          dstEncoding = getExpandDimsParentEncoding(expandOp, encoding);
+          derived = true;
+        }
       }
-      if (dstEncoding)
-        hasChanged |= layouts[value].encodings.insert(dstEncoding);
+      if (dstEncoding) {
+        auto &layoutInfo = layouts[value];
+        // An encoding is derived only while every path to it is derived.
+        if (layoutInfo.encodings.insert(dstEncoding)) {
+          hasChanged = true;
+          if (derived)
+            layoutInfo.derivedEncodings.insert(dstEncoding);
+        } else if (!derived) {
+          hasChanged |= layoutInfo.derivedEncodings.erase(dstEncoding);
+        }
+      }
     }
     if (hasChanged)
       changed.push_back(value);
@@ -285,7 +418,7 @@ SmallVector<Value> LayoutPropagation::propagateToUsers(Value value,
     if (auto yieldOp = dyn_cast<scf::YieldOp>(user)) {
       auto parent = yieldOp->getParentOp();
       SmallVector<Value> valuesToPropagate;
-      if (isa<scf::ForOp, scf::IfOp, scf::WhileOp>(parent))
+      if (isa<scf::ForOp, scf::IfOp>(parent))
         valuesToPropagate.push_back(parent->getResult(use.getOperandNumber()));
       if (auto forOp = dyn_cast<scf::ForOp>(parent))
         valuesToPropagate.push_back(
@@ -298,8 +431,10 @@ SmallVector<Value> LayoutPropagation::propagateToUsers(Value value,
       continue;
     }
     if (auto conditionOp = dyn_cast<scf::ConditionOp>(user)) {
-      auto whileOp = cast<scf::WhileOp>(conditionOp->getParentOp());
       // Skip arg 0 as it is the condition.
+      if (use.getOperandNumber() == 0)
+        continue;
+      auto whileOp = cast<scf::WhileOp>(conditionOp->getParentOp());
       unsigned argIndex = use.getOperandNumber() - 1;
       Value afterArg = whileOp.getAfterArguments()[argIndex];
       Value result = whileOp->getResult(argIndex);
@@ -355,18 +490,405 @@ void LayoutPropagation::propagateLayout() {
   }
 }
 
+static void
+collectUseTargets(OpOperand &use, Attribute enc,
+                  SmallVectorImpl<std::pair<Value, Attribute>> &targets) {
+  Operation *user = use.getOwner();
+
+  if (auto forOp = dyn_cast<scf::ForOp>(user)) {
+    targets.push_back({forOp.getTiedLoopRegionIterArg(&use), enc});
+    targets.push_back({forOp.getTiedLoopResult(&use), enc});
+    return;
+  }
+  if (auto whileOp = dyn_cast<scf::WhileOp>(user)) {
+    targets.push_back(
+        {whileOp.getBeforeArguments()[use.getOperandNumber()], enc});
+    return;
+  }
+  if (auto yieldOp = dyn_cast<scf::YieldOp>(user)) {
+    auto parent = yieldOp->getParentOp();
+    if (isa<scf::ForOp, scf::IfOp>(parent))
+      targets.push_back({parent->getResult(use.getOperandNumber()), enc});
+    if (auto forOp = dyn_cast<scf::ForOp>(parent))
+      targets.push_back({forOp.getRegionIterArg(use.getOperandNumber()), enc});
+    if (auto whileOp = dyn_cast<scf::WhileOp>(parent))
+      targets.push_back(
+          {whileOp.getBeforeArguments()[use.getOperandNumber()], enc});
+    return;
+  }
+  if (auto conditionOp = dyn_cast<scf::ConditionOp>(user)) {
+    if (use.getOperandNumber() == 0)
+      return;
+    auto whileOp = cast<scf::WhileOp>(conditionOp->getParentOp());
+    unsigned argIndex = use.getOperandNumber() - 1;
+    targets.push_back({whileOp.getAfterArguments()[argIndex], enc});
+    targets.push_back({whileOp->getResult(argIndex), enc});
+    return;
+  }
+  if (isa<nvidia_gpu::WarpGroupDotWaitOp>(user)) {
+    Value result = user->getResult(use.getOperandNumber());
+    if (getTensorEncoding(result))
+      targets.push_back({result, enc});
+    return;
+  }
+  if (auto gatherOp = dyn_cast<GatherOp>(user)) {
+    if (!gatherOp.getEfficientLayout() &&
+        &use == &gatherOp.getIndicesMutable()) {
+      Attribute dstEnc = inferDstEncoding(user, enc);
+      if (dstEnc)
+        targets.push_back({gatherOp.getResult(), dstEnc});
+      return;
+    }
+  }
+  if (user->hasTrait<OpTrait::SameOperandsAndResultEncoding>() ||
+      user->hasTrait<OpTrait::Elementwise>() ||
+      isa<ReduceOp, ExpandDimsOp, ReshapeOp, TransOp, JoinOp, SplitOp,
+          ConvertLayoutOp>(user)) {
+    for (Value result : user->getResults()) {
+      if (!getTensorEncoding(result))
+        continue;
+      Attribute dstEnc =
+          isa<ConvertLayoutOp>(user) ? enc : inferDstEncoding(user, enc);
+      if (dstEnc)
+        targets.push_back({result, dstEnc});
+    }
+  }
+}
+
+static bool isLayoutTransparentProducer(Operation *op) {
+  if (isLayoutAnchor(op) || op->getNumRegions() != 0 || isExpensiveMathOp(op))
+    return false;
+  if (isa<BroadcastOp, ExpandDimsOp, ConvertLayoutOp>(op))
+    return true;
+  return (op->hasTrait<OpTrait::Elementwise>() ||
+          op->hasTrait<OpTrait::SameOperandsAndResultEncoding>()) &&
+         isMemoryEffectFree(op);
+}
+
+static constexpr int kMaxRematDepth = 6;
+
+static int64_t
+getRematConversionCost(Value value, Attribute required, int depth,
+                       function_ref<Attribute(Value)> encodingOf) {
+  if (depth == kMaxRematDepth
+          ? isEquivalentEncoding(value, encodingOf(value), required)
+          : encodingOf(value) == required)
+    return 0;
+  int64_t full = getConvertUnitCost(value);
+  Operation *def = value.getDefiningOp();
+  if (!def || depth <= 0)
+    return full;
+  if (isa<arith::ConstantOp, SplatOp, MakeRangeOp>(def))
+    return 0;
+  if (!isLayoutTransparentProducer(def))
+    return full;
+  Attribute srcRequired =
+      isa<ConvertLayoutOp>(def) ? required : inferSrcEncoding(def, required);
+  if (!srcRequired)
+    return full;
+  int64_t sum = 0;
+  for (Value operand : def->getOperands()) {
+    if (!isa<RankedTensorType>(operand.getType()))
+      continue;
+    sum += getRematConversionCost(operand, srcRequired, depth - 1, encodingOf);
+    if (sum >= full)
+      return full;
+  }
+  return sum;
+}
+
+void LayoutPropagation::resolveConflictsByComponent(
+    const llvm::MapVector<Value, SmallVector<Attribute>> &candidates) {
+  llvm::EquivalenceClasses<Value> tied;
+  auto unite = [&](Value a, Value b) {
+    if (candidates.count(a) && candidates.count(b))
+      tied.unionSets(a, b);
+  };
+  for (auto &it : candidates)
+    tied.insert(it.first);
+  for (auto &it : candidates) {
+    Value v = it.first;
+    if (auto arg = dyn_cast<BlockArgument>(v)) {
+      auto forOp = dyn_cast<scf::ForOp>(arg.getOwner()->getParentOp());
+      if (!forOp || arg.getArgNumber() < forOp.getNumInductionVars())
+        continue;
+      unsigned i = arg.getArgNumber() - forOp.getNumInductionVars();
+      unite(v, forOp.getResult(i));
+      unite(v, forOp.getInitArgs()[i]);
+      unite(v, forOp.getYieldedValues()[i]);
+      continue;
+    }
+    Operation *def = v.getDefiningOp();
+    if (auto forOp = dyn_cast<scf::ForOp>(def)) {
+      unsigned i = cast<OpResult>(v).getResultNumber();
+      unite(v, forOp.getRegionIterArg(i));
+    } else if (auto ifOp = dyn_cast<scf::IfOp>(def)) {
+      unsigned i = cast<OpResult>(v).getResultNumber();
+      unite(v, ifOp.thenYield().getOperand(i));
+      if (!ifOp.getElseRegion().empty())
+        unite(v, ifOp.elseYield().getOperand(i));
+    } else if ((def->hasTrait<OpTrait::Elementwise>() ||
+                def->hasTrait<OpTrait::SameOperandsAndResultEncoding>()) &&
+               def->getNumRegions() == 0 && !isLayoutAnchor(def)) {
+      for (Value operand : def->getOperands())
+        if (isa<RankedTensorType>(operand.getType()))
+          unite(v, operand);
+    }
+  }
+
+  llvm::MapVector<Value, SmallVector<Value>> components;
+  for (auto &it : candidates)
+    components[tied.getLeaderValue(it.first)].push_back(it.first);
+
+  auto resolvedEncoding = [&](Value v) -> Attribute {
+    auto it = layouts.find(v);
+    if (it != layouts.end() && !it->second.encodings.empty())
+      return *it->second.encodings.begin();
+    return getTensorEncoding(v);
+  };
+
+  struct AssignmentCost {
+    int64_t total = 0;
+    int64_t inLoop = 0;
+  };
+  // Stage 0 moves scf.for-bound components when in-loop convert cost strictly
+  // drops without raising total cost. Stage 1 lets direct external neighbors of
+  // Stage-0 moved components (e.g., a post-loop tt.reduce consuming the moved
+  // accumulator) follow when that strictly lowers total cost; Stage-0 moved
+  // components are not reconsidered in Stage 1.
+  DenseSet<Value> movedInStage0;
+  DenseSet<Value> movedRoots;
+  for (int stage = 0; stage < 2; ++stage) {
+    if (stage == 1 && movedInStage0.empty())
+      break;
+    for (auto &[root, members] : components) {
+      if (stage == 1 && movedRoots.contains(root))
+        continue;
+      DenseSet<Value> inComponent(members.begin(), members.end());
+      SmallVector<Attribute> shared(candidates.lookup(members.front()));
+      bool skip = false;
+      bool hasForCarriedValue = false;
+      for (Value m : members) {
+        const SmallVector<Attribute> &cands = candidates.lookup(m);
+        llvm::erase_if(shared, [&](Attribute enc) {
+          return !llvm::is_contained(cands, enc);
+        });
+        if (Operation *def = m.getDefiningOp()) {
+          skip |= isLayoutAnchor(def) || isa<LoadOp, scf::WhileOp>(def);
+          hasForCarriedValue |= isa<scf::ForOp>(def);
+        } else {
+          auto arg = cast<BlockArgument>(m);
+          bool isForArg = isa<scf::ForOp>(arg.getOwner()->getParentOp());
+          skip |= !isForArg;
+          hasForCarriedValue |= isForArg;
+        }
+      }
+      if (skip || shared.size() < 2)
+        continue;
+
+      if (stage == 0 && !hasForCarriedValue)
+        continue;
+
+      DenseMap<Value, Attribute> resolved;
+      bool adjacentToStage0 = false;
+      for (Value m : members) {
+        resolved[m] = resolvedEncoding(m);
+        if (stage == 1) {
+          if (Operation *def = m.getDefiningOp())
+            for (Value operand : def->getOperands())
+              adjacentToStage0 |= !inComponent.contains(operand) &&
+                                  movedInStage0.contains(operand);
+          for (Operation *user : m.getUsers())
+            for (Value result : user->getResults())
+              adjacentToStage0 |= !inComponent.contains(result) &&
+                                  movedInStage0.contains(result);
+        }
+      }
+      if (stage == 1 && !adjacentToStage0)
+        continue;
+
+      auto priceAssignment = [&](function_ref<Attribute(Value)> assignment) {
+        AssignmentCost result;
+        auto charge = [&](int64_t weight, int64_t c) {
+          result.total += weight * c;
+          if (weight > 1)
+            result.inLoop += weight * c;
+        };
+        auto assignedEncoding = [&](Value v) {
+          return inComponent.contains(v) ? assignment(v) : resolvedEncoding(v);
+        };
+        auto operandCost = [&](Value operand, Attribute req, Operation *at) {
+          charge(getOpLoopFrequencyWeight(at),
+                 getRematConversionCost(operand, req, kMaxRematDepth,
+                                        assignedEncoding));
+        };
+        for (Value m : members) {
+          Attribute enc = assignment(m);
+          if (auto arg = dyn_cast<BlockArgument>(m)) {
+            auto forOp = cast<scf::ForOp>(arg.getOwner()->getParentOp());
+            unsigned i = arg.getArgNumber() - forOp.getNumInductionVars();
+            operandCost(forOp.getInitArgs()[i], enc, forOp);
+            Value yielded = forOp.getYieldedValues()[i];
+            operandCost(yielded, enc,
+                        yielded.getParentBlock()->getTerminator());
+          } else if (Operation *def = m.getDefiningOp()) {
+            if (auto forOp = dyn_cast<scf::ForOp>(def)) {
+              unsigned i = cast<OpResult>(m).getResultNumber();
+              Value arg = forOp.getRegionIterArg(i);
+              if (!isEquivalentEncoding(m, assignedEncoding(arg), enc))
+                charge(getOpLoopFrequencyWeight(forOp), getConvertUnitCost(m));
+            } else if (auto ifOp = dyn_cast<scf::IfOp>(def)) {
+              unsigned i = cast<OpResult>(m).getResultNumber();
+              operandCost(ifOp.thenYield().getOperand(i), enc,
+                          ifOp.thenYield());
+              if (!ifOp.getElseRegion().empty())
+                operandCost(ifOp.elseYield().getOperand(i), enc,
+                            ifOp.elseYield());
+            } else {
+              Attribute srcReq =
+                  isa<ConvertLayoutOp>(def) ? enc : inferSrcEncoding(def, enc);
+              for (Value operand : def->getOperands()) {
+                if (!isa<RankedTensorType>(operand.getType()))
+                  continue;
+                if (!srcReq)
+                  charge(getOpLoopFrequencyWeight(def),
+                         getConvertUnitCost(operand));
+                else
+                  operandCost(operand, srcReq, def);
+              }
+            }
+          }
+          for (OpOperand &use : m.getUses()) {
+            Operation *user = use.getOwner();
+            int64_t weight = getOpLoopFrequencyWeight(user);
+            SmallVector<std::pair<Value, Attribute>> targets;
+            collectUseTargets(use, enc, targets);
+            if (targets.empty()) {
+              charge(weight,
+                     getRematConversionCost(m, getTensorEncoding(m),
+                                            kMaxRematDepth, assignedEncoding));
+              continue;
+            }
+            for (auto &[target, dstEnc] : targets) {
+              if (inComponent.contains(target) ||
+                  isEquivalentEncoding(target, resolvedEncoding(target),
+                                       dstEnc))
+                continue;
+              int64_t c = getConvertUnitCost(m);
+              auto it = candidates.find(target);
+              if (it != candidates.end() &&
+                  llvm::is_contained(it->second, dstEnc))
+                c = std::min(c, getConvertUnitCost(target));
+              charge(weight, c);
+            }
+          }
+        }
+        return result;
+      };
+
+      auto bestCost =
+          priceAssignment([&](Value v) { return resolved.lookup(v); });
+      Attribute best;
+      for (Attribute enc : shared) {
+        auto cost = priceAssignment([&](Value) { return enc; });
+        bool better = stage == 1 ? cost.total < bestCost.total
+                                 : cost.inLoop < bestCost.inLoop &&
+                                       cost.total <= bestCost.total;
+        if (better) {
+          bestCost = cost;
+          best = enc;
+        }
+      }
+      if (!best)
+        continue;
+      LDBG("stage " << stage << " component of " << members.size()
+                    << " values moved to " << best << ", convert cost "
+                    << bestCost.total << " (inLoop " << bestCost.inLoop << ")");
+      for (Value m : members) {
+        LayoutInfo &info = layouts[m];
+        info.encodings.clear();
+        info.encodings.insert(best);
+        if (stage == 0)
+          movedInStage0.insert(m);
+      }
+      if (stage == 0)
+        movedRoots.insert(root);
+    }
+  }
+}
+
 void LayoutPropagation::resolveConflicts() {
+  if (!enableSm75LoopComponent) {
+    for (auto &it : layouts) {
+      Operation *op = it.first.getDefiningOp();
+      LayoutInfo &info = it.second;
+      if (info.encodings.size() <= 1)
+        continue;
+      // Hacky resolve, prefer block encoding.
+      // TODO: add a proper heuristic.
+      Attribute encoding = *info.encodings.begin();
+      bool isLoadOrStore =
+          op && isa<LoadOp, StoreOp, AtomicRMWOp, AtomicCASOp>(op);
+      for (auto &e : info.encodings) {
+        if ((isLoadOrStore && isa<BlockedEncodingAttr>(e)) ||
+            (!isLoadOrStore && isa<MmaEncodingTrait>(e))) {
+          encoding = e;
+          break;
+        }
+      }
+      info.encodings.clear();
+      info.encodings.insert(encoding);
+    }
+    return;
+  }
+  // A value reached only through synthesized expand_dims parents keeps its
+  // original encoding as an option so per-value resolution stays baseline
+  // unless component resolution proves a synthesized parent is cheaper.
+  for (auto &it : layouts) {
+    LayoutInfo &info = it.second;
+    if (info.derivedEncodings.empty() ||
+        !llvm::all_of(info.encodings, [&](Attribute enc) {
+          return info.derivedEncodings.contains(enc);
+        }))
+      continue;
+    if (Attribute original = getTensorEncoding(it.first))
+      info.encodings.insert(original);
+  }
+
+  // Capture blocked/blocked-slice candidate sets before per-value resolution
+  // collapses them.
+  llvm::MapVector<Value, SmallVector<Attribute>> componentCandidates;
+  for (auto &it : layouts) {
+    const LayoutInfo &info = it.second;
+    if (info.encodings.size() <= 1 ||
+        !isa<RankedTensorType>(it.first.getType()))
+      continue;
+    bool blockedOnly = llvm::all_of(info.encodings, [](Attribute enc) {
+      return isBlockedOrBlockedSliceEncoding(enc);
+    });
+    if (blockedOnly)
+      componentCandidates[it.first] = SmallVector<Attribute>(
+          info.encodings.begin(), info.encodings.end());
+  }
+
   for (auto &it : layouts) {
     Operation *op = it.first.getDefiningOp();
     LayoutInfo &info = it.second;
     if (info.encodings.size() <= 1)
       continue;
+    // Leave derived (synthesized-parent) encodings to component resolution.
+    SmallVector<Attribute> legacy;
+    for (Attribute e : info.encodings)
+      if (!info.derivedEncodings.contains(e))
+        legacy.push_back(e);
+    if (legacy.empty())
+      legacy.assign(info.encodings.begin(), info.encodings.end());
     // Hacky resolve, prefer block encoding.
     // TODO: add a proper heuristic.
-    Attribute encoding = *info.encodings.begin();
+    Attribute encoding = legacy.front();
     bool isLoadOrStore =
         op && isa<LoadOp, StoreOp, AtomicRMWOp, AtomicCASOp>(op);
-    for (Attribute e : info.encodings) {
+    for (Attribute e : legacy) {
       if ((isLoadOrStore && isa<BlockedEncodingAttr>(e)) ||
           (!isLoadOrStore && isa<MmaEncodingTrait>(e))) {
         encoding = e;
@@ -376,6 +898,9 @@ void LayoutPropagation::resolveConflicts() {
     info.encodings.clear();
     info.encodings.insert(encoding);
   }
+
+  if (!componentCandidates.empty())
+    resolveConflictsByComponent(componentCandidates);
 }
 
 void LayoutPropagation::dump() {
@@ -997,8 +1522,8 @@ static bool isExpensiveMathOp(Operation *op) {
              math::SqrtOp, math::RsqrtOp, math::ErfOp, math::CbrtOp>(op);
 }
 
-static int64_t getByteCount(Value result, int64_t minElementCount = 0,
-                            int64_t minBitWidth = 0) {
+static int64_t getByteCount(Value result, int64_t minElementCount,
+                            int64_t minBitWidth) {
   int64_t elementCount = 0;
   int64_t dtypeBitWidth = 0;
   if (auto tensorTy = dyn_cast<RankedTensorType>(result.getType())) {
