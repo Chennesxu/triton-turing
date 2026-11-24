@@ -441,6 +441,12 @@ SmallVector<Value> LayoutPropagation::propagateToUsers(Value value,
         continue;
       }
     }
+    if (isa<AtomicRMWOp, AtomicCASOp>(user)) {
+      // Atomic ops are layout anchors whose layout must not change, even though
+      // they carry SameOperandsAndResultEncoding. Stop propagating operand
+      // layouts across them so stale candidates cannot leak to downstream ops.
+      continue;
+    }
     if (user->hasTrait<OpTrait::SameOperandsAndResultEncoding>() ||
         user->hasTrait<OpTrait::Elementwise>() ||
         isa<ReduceOp, ExpandDimsOp, ReshapeOp, TransOp, JoinOp, SplitOp,
@@ -525,6 +531,8 @@ collectUseTargets(OpOperand &use, Attribute enc,
       return;
     }
   }
+  if (isa<AtomicRMWOp, AtomicCASOp>(user))
+    return;
   if (user->hasTrait<OpTrait::SameOperandsAndResultEncoding>() ||
       user->hasTrait<OpTrait::Elementwise>() ||
       isa<ReduceOp, ExpandDimsOp, ReshapeOp, TransOp, JoinOp, SplitOp,
