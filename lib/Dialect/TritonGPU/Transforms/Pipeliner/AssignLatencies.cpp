@@ -1,3 +1,5 @@
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/IR/TypeUtilities.h"
 #include "triton/Analysis/AxisInfo.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/MMAv5PipelineUtility.h"
@@ -56,6 +58,76 @@ void assignUserProvidedLatencies(scf::ForOp forOp,
   }
 }
 
+// Return true if `loadOp` is an integer index load whose SSA use chain inside
+// `forOp` feeds exclusively into pointer address calculations of downstream
+// dist==0 loads in `loadOpToIndLevel` (never mask/other or any other consumer).
+bool isIndirectAddressIndexLoad(
+    Operation *loadOp, scf::ForOp forOp,
+    const llvm::MapVector<Operation *, std::pair<int, Operation *>>
+        &loadOpToIndLevel) {
+  auto ttLoad = dyn_cast<tt::LoadOp>(loadOp);
+  if (!ttLoad)
+    return false;
+  Type elemTy = getElementTypeOrSelf(ttLoad.getResult().getType());
+  auto intTy = dyn_cast<IntegerType>(elemTy);
+  if (!intTy || intTy.getWidth() <= 1)
+    return false;
+  if (ttLoad.getResult().use_empty())
+    return false;
+
+  SmallVector<Value> worklist = {ttLoad.getResult()};
+  DenseSet<Value> visited;
+  visited.insert(ttLoad.getResult());
+  bool reachedDistZeroPtr = false;
+
+  while (!worklist.empty()) {
+    Value v = worklist.pop_back_val();
+    for (OpOperand &use : v.getUses()) {
+      Operation *user = use.getOwner();
+      if (user->getBlock() != forOp.getBody())
+        return false;
+
+      if (auto dstLoad = dyn_cast<tt::LoadOp>(user)) {
+        auto it = loadOpToIndLevel.find(dstLoad);
+        if (it == loadOpToIndLevel.end() || it->second.first != 0)
+          return false;
+        if (&use != &dstLoad.getPtrMutable())
+          return false;
+        reachedDistZeroPtr = true;
+        continue;
+      }
+
+      bool isAddrOp = false;
+      if (isa<arith::ExtSIOp, arith::ExtUIOp, arith::AddIOp, arith::SubIOp,
+              arith::MulIOp, arith::DivSIOp, arith::DivUIOp, arith::RemSIOp,
+              arith::RemUIOp, arith::ShLIOp, arith::ShRSIOp, arith::ShRUIOp,
+              arith::AndIOp, arith::OrIOp, arith::XOrIOp>(user)) {
+        Type resElem = getElementTypeOrSelf(user->getResult(0).getType());
+        auto resInt = dyn_cast<IntegerType>(resElem);
+        isAddrOp = resInt && resInt.getWidth() > 1;
+      } else if (isa<tt::ExpandDimsOp, tt::BroadcastOp, tt::SplatOp>(user)) {
+        Type resElem = getElementTypeOrSelf(user->getResult(0).getType());
+        auto resInt = dyn_cast<IntegerType>(resElem);
+        isAddrOp =
+            (resInt && resInt.getWidth() > 1) || isa<tt::PointerType>(resElem);
+      } else if (auto addPtr = dyn_cast<tt::AddPtrOp>(user)) {
+        Type resElem = getElementTypeOrSelf(addPtr.getResult().getType());
+        isAddrOp = isa<tt::PointerType>(resElem);
+      }
+
+      if (!isAddrOp)
+        return false;
+
+      Value res = user->getResult(0);
+      if (res.use_empty())
+        return false;
+      if (visited.insert(res).second)
+        worklist.push_back(res);
+    }
+  }
+  return reachedDistZeroPtr;
+}
+
 class AssignLoadLatencies {
   static constexpr int64_t kSm75SharedMemoryBudget = 64 * 1024;
 public:
@@ -93,7 +165,19 @@ public:
     if (loadLatency == 0)
       return;
 
-    for (auto [loadOp, dist] : loadOpToIndLevel) {
+    // On SM75 sync-copy with num_stages=3 and 1 clamped pipeline slot,
+    // pipelining dist==1 address index loads adds standalone shared buffers
+    // and two per-iteration CTA barriers while keeping main data loads at
+    // 1 slot. Keep the full-set clamp result intact and skip only verified
+    // address-only integer index loads when emitting latencies.
+    bool skipSm75IndirectIndexLoads =
+        computeCapability == 75 && numStages == 3 && loadLatency == 1;
+    for (auto &[loadOp, info] : loadOpToIndLevel) {
+      if (skipSm75IndirectIndexLoads && info.first == 1 &&
+          isIndirectAddressIndexLoad(loadOp, forOp, loadOpToIndLevel)) {
+        LDBG("sm75: skipping indirect address index load " << *loadOp);
+        continue;
+      }
       opLatency[loadOp] = loadLatency;
     }
   }
